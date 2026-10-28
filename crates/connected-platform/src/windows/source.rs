@@ -7,6 +7,7 @@
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
@@ -24,7 +25,7 @@ use windows_sys::Win32::UI::Input::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
+    HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
     MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage,
     UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
@@ -47,6 +48,12 @@ struct Shared {
 }
 
 static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
+
+/// Whether raw input has ever delivered mouse movement. If it has not, the hook's own
+/// positions stand in for it: they miss a push against a screen edge, but moving still works.
+static RAW_SEEN: AtomicBool = AtomicBool::new(false);
+static LAST_HOOK_X: AtomicI32 = AtomicI32::new(i32::MIN);
+static LAST_HOOK_Y: AtomicI32 = AtomicI32::new(i32::MIN);
 
 fn with_shared<R>(action: impl FnOnce(&mut Shared) -> R) -> Option<R> {
     let mut guard = SHARED.lock().ok()?;
@@ -190,7 +197,8 @@ unsafe fn unhook(hook: HHOOK) {
 }
 
 /// A window that is never shown and only receives raw mouse input, even when another
-/// program is in front.
+/// program is in front. It is a top-level window rather than a message-only one, because
+/// Windows does not reliably deliver raw input to those.
 ///
 /// # Safety
 /// `module` is this program's module handle.
@@ -223,7 +231,7 @@ unsafe fn create_raw_input_window(
             0,
             0,
             0,
-            HWND_MESSAGE,
+            null_mut(),
             null_mut(),
             module,
             null(),
@@ -280,6 +288,7 @@ unsafe fn read_raw_input(handle: HRAWINPUT) {
             return;
         }
         if mouse.lLastX != 0 || mouse.lLastY != 0 {
+            RAW_SEEN.store(true, Ordering::Relaxed);
             report(InputEvent::MouseMove { dx: mouse.lLastX, dy: mouse.lLastY });
         }
     }
@@ -337,7 +346,15 @@ fn mouse_event(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
     let wheel = i32::from(high as i16);
 
     match message {
-        WM_MOUSEMOVE => with_shared(|shared| shared.capture).unwrap_or(false),
+        WM_MOUSEMOVE => {
+            let (x, y) = (info.pt.x, info.pt.y);
+            let (last_x, last_y) = (LAST_HOOK_X.swap(x, Ordering::Relaxed), LAST_HOOK_Y.swap(y, Ordering::Relaxed));
+            if !RAW_SEEN.load(Ordering::Relaxed) && last_x != i32::MIN && (x != last_x || y != last_y) {
+                report(InputEvent::MouseMove { dx: x - last_x, dy: y - last_y })
+            } else {
+                with_shared(|shared| shared.capture).unwrap_or(false)
+            }
+        }
         WM_LBUTTONDOWN => button(MouseButton::Left, ButtonState::Down),
         WM_LBUTTONUP => button(MouseButton::Left, ButtonState::Up),
         WM_RBUTTONDOWN => button(MouseButton::Right, ButtonState::Down),

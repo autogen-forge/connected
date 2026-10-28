@@ -54,6 +54,8 @@ const SCREEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a link thread waits at the socket for the other computer before it looks at what
 /// is queued to send. It is also how late anything queued to send can go out.
 const INBOUND_WAIT: Duration = Duration::from_millis(2);
+/// How long the mesh runs before it says that it has read no input at all.
+const DEAF_AFTER: Duration = Duration::from_secs(15);
 const PING_EVERY: Duration = Duration::from_secs(2);
 /// Larger than any real display; keeps absurd announcements out of the layout maths.
 const MAX_SCREEN_SIDE: i32 = 100_000;
@@ -727,6 +729,8 @@ fn event_loop(
 ) -> Result<()> {
     let mut held: HashSet<u16> = HashSet::new();
     let mut heard_input = false;
+    let mut warned_deaf = false;
+    let started = Instant::now();
 
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Relaxed) {
@@ -738,6 +742,10 @@ fn event_loop(
             }
 
             let Some(input) = world.source.next_event_timeout(INPUT_POLL)? else {
+                if !heard_input && !warned_deaf && started.elapsed() > DEAF_AFTER {
+                    warned_deaf = true;
+                    (world.log)("no keyboard or mouse input has been read yet; if it was used, this computer cannot read it");
+                }
                 continue;
             };
             if !heard_input {
