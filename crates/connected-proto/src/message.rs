@@ -22,6 +22,25 @@ impl Edge {
     }
 }
 
+/// One computer in a `Message::Layout`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayoutScreen {
+    /// The name it was paired under; the sharing computer's own name for itself.
+    pub name: String,
+    /// Where the corner of all its displays is on the shared desktop.
+    pub x: i32,
+    pub y: i32,
+    /// Its displays, measured from (`x`, `y`).
+    pub displays: Vec<Rect>,
+    /// How much each display is magnified, in percent.
+    pub scales: Vec<u16>,
+    pub os: Os,
+    /// Whether this is the computer that receives the message.
+    pub you: bool,
+    /// Whether it is connected. The sharing computer itself always is.
+    pub online: bool,
+}
+
 /// The operating system a computer runs, for showing which is which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -191,5 +210,12 @@ pub enum Message {
         /// display), in the same order as `displays`.
         scales: Vec<u16>,
         os: Os,
+    },
+
+    /// How the computers are laid out, sent by the sharing computer to each client when it
+    /// connects and whenever the layout or who is connected changes, so a client can show the
+    /// same layout the person arranged.
+    Layout {
+        screens: Vec<LayoutScreen>,
     },
 }

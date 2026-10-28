@@ -101,6 +101,18 @@ mod tests {
             Message::Ping(1),
             Message::Pong(1),
             Message::PairDecision { accepted: true },
+            Message::Layout {
+                screens: vec![LayoutScreen {
+                    name: "desk".into(),
+                    x: -10,
+                    y: 20,
+                    displays: vec![Rect::new(0, 0, 1920, 1080)],
+                    scales: vec![200],
+                    os: Os::Mac,
+                    you: false,
+                    online: true,
+                }],
+            },
             Message::Screen {
                 displays: vec![Rect::new(0, 0, 2560, 1440), Rect::new(2560, 360, 1920, 1080)],
                 scales: vec![100, 150],

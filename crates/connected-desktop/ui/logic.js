@@ -309,6 +309,47 @@ export function pairingAddress(snap, listeningOn) {
   return snap.lan_address ? `${snap.lan_address}:${port}` : listeningOn;
 }
 
+/**
+ * Which page of the system settings a permission is given on, by the name the app reports it
+ * under: `{ pane, label }`. Posting events is allowed together with the other accessibility
+ * features; reading input has a page of its own.
+ */
+export function permissionPane(name) {
+  if (name === 'Input Monitoring') return { pane: 'input_monitoring', label: '입력 모니터링' };
+  return { pane: 'accessibility', label: '손쉬운 사용' };
+}
+
+/**
+ * The steps of giving permissions, one for each page of the system settings, in the order the
+ * permissions are listed: `{ pane, label, names, done }`. `current` is the first step not yet
+ * done, or -1 when every permission is given.
+ */
+export function permissionSteps(permissions) {
+  const steps = [];
+  for (const permission of permissions) {
+    const page = permissionPane(permission.name);
+    let step = steps.find((known) => known.pane === page.pane);
+    if (!step) {
+      step = { ...page, names: [], done: true };
+      steps.push(step);
+    }
+    step.names.push(permission.name);
+    if (!permission.granted) step.done = false;
+  }
+  return { steps, current: steps.findIndex((step) => !step.done) };
+}
+
+/** The settings pages to visit for the permissions that are missing, each once. */
+export function missingPanes(permissions) {
+  const panes = [];
+  for (const permission of permissions) {
+    if (permission.granted) continue;
+    const page = permissionPane(permission.name);
+    if (!panes.some((known) => known.pane === page.pane)) panes.push(page);
+  }
+  return panes;
+}
+
 /** The tabs of the navigation bar, as `[id, label]` pairs. */
 export function tabsFor() {
   return [
@@ -329,7 +370,10 @@ export function statusBarOf(snap) {
 
   if (snap.mode === 'share') {
     const server = snap.server;
-    items.push(server ? { tone: 'good', text: '공유 중' } : { tone: 'muted', text: '공유 중지됨' });
+    // Listening is not yet sharing: until another computer has connected, nothing is shared.
+    if (!server) items.push({ tone: 'muted', text: '공유 중지됨' });
+    else if (server.clients.length === 0) items.push({ tone: 'warn', text: '연결 대기 중' });
+    else items.push({ tone: 'good', text: '공유 중' });
     if (server) {
       items.push({
         tone: server.clients.length > 0 ? 'good' : 'warn',

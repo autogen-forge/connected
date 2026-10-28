@@ -175,6 +175,8 @@ pub struct AppModel {
     logs: LogBuffer,
     local_displays: Vec<Rect>,
     local_scales: Vec<u16>,
+    /// Whether the system was last seen to be withholding a permission this program needs.
+    permissions_missing: bool,
     /// Something the person should be told, such as why starting failed.
     pub notice: Option<String>,
 }
@@ -209,6 +211,7 @@ impl AppModel {
         Self {
             local_displays,
             local_scales,
+            permissions_missing: false,
             home,
             node,
             backends,
@@ -228,6 +231,18 @@ impl AppModel {
     /// This computer's displays, measured from the corner of all of them.
     pub fn local_displays(&self) -> &[Rect] {
         &self.local_displays
+    }
+
+    /// Takes in whether a permission is missing, as the system says right now. When the last one
+    /// is granted, a notice that starting failed is taken down: it was most likely about that,
+    /// and the person should not have to dismiss it by hand. Other notices stay.
+    pub fn note_permissions(&mut self, missing: bool) {
+        let granted_now = self.permissions_missing && !missing;
+        self.permissions_missing = missing;
+        if granted_now && self.notice.as_deref().is_some_and(is_start_failure) {
+            self.notice = None;
+            self.log_line("permissions were granted");
+        }
     }
 
     /// How much each of this computer's displays is magnified, in percent.
@@ -259,6 +274,11 @@ impl AppModel {
 
     pub fn server_state(&self) -> Option<ServerState> {
         self.server.as_ref().map(ServerHandle::state)
+    }
+
+    /// How the sharing computer says the computers are laid out, while this one receives.
+    pub fn client_layout(&self) -> Option<Vec<connected_proto::LayoutScreen>> {
+        self.client.as_ref().and_then(ClientHandle::layout)
     }
 
     pub fn client_status(&self) -> Option<ClientStatus> {
@@ -590,6 +610,11 @@ impl Drop for AppModel {
     }
 }
 
+/// Whether a notice says that sharing or receiving could not be started.
+fn is_start_failure(notice: &str) -> bool {
+    notice.starts_with("공유를 시작하지 못했습니다") || notice.starts_with("받기를 시작하지 못했습니다")
+}
+
 /// Why a screen cannot be put in a spot, in words for the person using the app.
 fn place_error_text(error: &PlaceError) -> String {
     match error {
@@ -702,6 +727,33 @@ mod tests {
         model.set_mode(Mode::Receive);
         assert!(!model.is_running());
         assert_eq!(model.settings.mode, Mode::Receive);
+    }
+
+    #[test]
+    fn granting_the_last_permission_takes_down_the_notice_that_starting_failed() {
+        let mut model = model("desk");
+        model.notice = Some("공유를 시작하지 못했습니다: permission denied".into());
+        model.note_permissions(true);
+        assert!(model.notice.is_some(), "still missing, so the notice stays");
+        model.note_permissions(false);
+        assert!(model.notice.is_none());
+    }
+
+    #[test]
+    fn granting_a_permission_leaves_other_notices_alone() {
+        let mut model = model("desk");
+        model.note_permissions(true);
+        model.notice = Some("‘laptop’ 화면과 겹치게 놓을 수 없습니다.".into());
+        model.note_permissions(false);
+        assert!(model.notice.is_some());
+    }
+
+    #[test]
+    fn a_notice_is_not_taken_down_if_nothing_was_ever_missing() {
+        let mut model = model("desk");
+        model.notice = Some("받기를 시작하지 못했습니다: refused".into());
+        model.note_permissions(false);
+        assert!(model.notice.is_some());
     }
 
     #[test]
@@ -850,6 +902,14 @@ mod tests {
         }
         let device = desk.devices().remove(0);
         assert_eq!(device.displays, Some(vec![Rect::new(0, 0, 2560, 1440)]));
+
+        // The receiving computer is shown the layout the sharing one arranged, with itself marked.
+        wait_until("the laptop to receive the layout", || laptop.client_layout().is_some());
+        let layout = laptop.client_layout().unwrap();
+        let mine = layout.iter().find(|screen| screen.you).expect("the laptop is in the layout");
+        assert_eq!(mine.name, "laptop");
+        assert_eq!((mine.x, mine.y), (1920, 0));
+        assert!(layout.iter().any(|screen| screen.name == "desk" && !screen.you));
         desk.tick();
         assert_eq!(
             desk.settings.known_screens.get("laptop"),

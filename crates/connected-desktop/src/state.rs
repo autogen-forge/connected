@@ -46,6 +46,11 @@ impl AppState {
         cached.1.clone()
     }
 
+    /// Whether permissions are looked up at all; the demo has none to ask for.
+    pub(crate) fn checks_permissions(&self) -> bool {
+        self.check_permissions
+    }
+
     /// Stops sharing or receiving and lets go of the keyboard and mouse. Called when the
     /// program is closing.
     pub fn shutdown(&self) {

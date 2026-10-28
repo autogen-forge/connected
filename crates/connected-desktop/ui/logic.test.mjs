@@ -11,6 +11,9 @@ import {
   fitView,
   formatSize,
   isPlaced,
+  missingPanes,
+  permissionPane,
+  permissionSteps,
   monitorFacts,
   overlapRegions,
   pairingAddress,
@@ -349,7 +352,10 @@ test('a sharing computer with nobody online is a warning, and a stopped one just
     devices: devices(2),
     server: { listening_on: ':1', active_screen: 'desk', clients: [] },
   }));
-  assert.deepEqual(idle.items[1], { tone: 'warn', text: '온라인 0 / 2대' });
+  assert.deepEqual(idle.items, [
+    { tone: 'warn', text: '연결 대기 중' },
+    { tone: 'warn', text: '온라인 0 / 2대' },
+  ]);
 
   const stopped = statusBarOf(sharing({ devices: devices(3), server: null }));
   assert.deepEqual(stopped, {
@@ -368,4 +374,62 @@ test('a receiving computer shows how it is connected, and has no address', () =>
     client: { status: 'connected', server: 'desk' },
   });
   assert.deepEqual(bar, { items: [{ tone: 'good', text: '‘desk’에 연결됨' }], address: null });
+});
+
+test('each permission is given on its own page of the system settings', () => {
+  assert.deepEqual(permissionPane('Accessibility'), { pane: 'accessibility', label: '손쉬운 사용' });
+  assert.deepEqual(permissionPane('Post Events'), { pane: 'accessibility', label: '손쉬운 사용' });
+  assert.deepEqual(permissionPane('Input Monitoring'), { pane: 'input_monitoring', label: '입력 모니터링' });
+});
+
+test('only the pages of missing permissions are offered, and each once', () => {
+  const permissions = [
+    { name: 'Accessibility', granted: false },
+    { name: 'Input Monitoring', granted: false },
+    { name: 'Post Events', granted: false },
+  ];
+  assert.deepEqual(missingPanes(permissions).map((page) => page.pane), ['accessibility', 'input_monitoring']);
+  permissions[0].granted = true;
+  permissions[2].granted = true;
+  assert.deepEqual(missingPanes(permissions).map((page) => page.pane), ['input_monitoring']);
+  permissions[1].granted = true;
+  assert.deepEqual(missingPanes(permissions), []);
+});
+
+test('permissions are given in steps, one for each page of the system settings', () => {
+  const permissions = [
+    { name: 'Accessibility', granted: false },
+    { name: 'Input Monitoring', granted: false },
+    { name: 'Post Events', granted: false },
+  ];
+  const first = permissionSteps(permissions);
+  assert.deepEqual(first.steps.map((step) => [step.pane, step.names, step.done]), [
+    ['accessibility', ['Accessibility', 'Post Events'], false],
+    ['input_monitoring', ['Input Monitoring'], false],
+  ]);
+  assert.equal(first.current, 0);
+});
+
+test('a step is done only when everything on its page is given', () => {
+  const second = permissionSteps([
+    { name: 'Accessibility', granted: true },
+    { name: 'Input Monitoring', granted: false },
+    { name: 'Post Events', granted: false },
+  ]);
+  assert.equal(second.steps[0].done, false, 'Post Events is still missing');
+  assert.equal(second.current, 0);
+
+  const third = permissionSteps([
+    { name: 'Accessibility', granted: true },
+    { name: 'Input Monitoring', granted: false },
+    { name: 'Post Events', granted: true },
+  ]);
+  assert.equal(third.steps[0].done, true);
+  assert.equal(third.current, 1, 'on to the next page');
+});
+
+test('with every permission given there is no current step', () => {
+  const done = permissionSteps([{ name: 'Accessibility', granted: true }, { name: 'Input Monitoring', granted: true }]);
+  assert.equal(done.current, -1);
+  assert.deepEqual(permissionSteps([]), { steps: [], current: -1 });
 });

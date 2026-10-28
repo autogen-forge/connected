@@ -139,6 +139,10 @@ fn start_laptop_with(node: &Node, addr: &str, logs: &Logs, screen: FixedScreen) 
 }
 
 impl Laptop {
+    fn layout(&self) -> Option<Vec<connected_proto::LayoutScreen>> {
+        self.handle.layout()
+    }
+
     fn calls(&self) -> Vec<SinkCall> {
         self.injected.calls()
     }
@@ -341,6 +345,36 @@ fn removing_the_device_the_cursor_is_on_brings_control_home() {
     wait_until("control to come back to the desk", &logs, || !desk.is_capturing());
     assert_eq!(desk.active_screen(), "desk");
     wait_until("the laptop to let go", &logs, || laptop.calls().last() == Some(&SinkCall::ReleaseAll));
+}
+
+#[test]
+fn a_client_is_told_how_the_computers_are_laid_out_and_which_one_it_is() {
+    let (mut desk, laptop, logs, ..) = linked(Edge::Right);
+    wait_until("the layout to reach the laptop", &logs, || laptop.layout().is_some());
+
+    let layout = laptop.layout().unwrap();
+    let find = |name: &str| layout.iter().find(|screen| screen.name == name).unwrap_or_else(|| panic!("no {name}"));
+    assert_eq!(layout.len(), 2);
+    assert_eq!((find("desk").x, find("desk").y), (0, 0));
+    assert_eq!((find("laptop").x, find("laptop").y), (SERVER_SCREEN.0, 0), "beside the desk, on its right");
+    assert!(find("laptop").you && !find("desk").you);
+    assert!(find("desk").online && find("laptop").online);
+    assert_eq!(find("laptop").displays, vec![Rect::new(0, 0, CLIENT_SCREEN.0, CLIENT_SCREEN.1)]);
+
+    // Moving the laptop on the desk reaches it too.
+    let devices = BTreeMap::new();
+    let local = [Rect::new(0, 0, SERVER_SCREEN.0, SERVER_SCREEN.1)];
+    let metrics = Metrics { this_computer: "desk", local: &local, devices: &devices };
+    let mut arrangement = Arrangement::default();
+    arrangement.place("laptop", 0, 1500, &metrics).unwrap();
+    desk.handle.set_arrangement(arrangement);
+    wait_until("the new layout to reach the laptop", &logs, || {
+        laptop.layout().is_some_and(|layout| layout.iter().any(|s| s.name == "laptop" && s.y == 1500))
+    });
+
+    // And it is forgotten with the connection.
+    desk.handle.stop();
+    wait_until("the layout to be forgotten", &logs, || laptop.layout().is_none());
 }
 
 #[test]

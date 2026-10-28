@@ -7,7 +7,7 @@ pub mod message;
 pub use codec::{CodecError, MAX_FRAME_LEN};
 pub use geometry::{Rect, bounds};
 pub use message::{
-    ButtonState, ClipFormat, ClipOffer, Edge, Message, Modifiers, MouseButton, Os,
+    ButtonState, ClipFormat, ClipOffer, Edge, LayoutScreen, Message, Modifiers, MouseButton, Os,
 };
 
 /// Bumped whenever a message change breaks compatibility.

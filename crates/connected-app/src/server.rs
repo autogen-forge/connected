@@ -19,11 +19,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use connected_core::{
-    Action, Arrangement, Desktop, InputEvent, InputSink, InputSource, Rect, Router, ScreenInfo,
-    normalize,
+    Action, Arrangement, Desktop, InputEvent, InputSink, InputSource, Metrics, Rect, Router,
+    ScreenInfo, normalize,
 };
 use connected_net::{Listener, NetError, Node, Session};
-use connected_proto::{ButtonState, Message, Os};
+use connected_proto::{ButtonState, LayoutScreen, Message, Os};
 
 use crate::error::{AppError, Result};
 use crate::{HEARTBEAT_TIMEOUT, Log};
@@ -261,8 +261,9 @@ fn serve(
     // them, and the cursor, from the main display's corner.
     let (displays, local_origin) = normalize(&screen.displays()?);
     let local = node.identity().name().to_owned();
+    let local_scales = screen.scales().unwrap_or_else(|_| vec![100; displays.len()]);
     let mut desktop = Desktop::new();
-    desktop.add(&local, displays);
+    desktop.add(&local, displays.clone());
     let mut router = Router::new(desktop, &local)?;
     if let Ok((x, y)) = screen.cursor() {
         router.set_local_cursor(x - local_origin.0, y - local_origin.1);
@@ -276,6 +277,7 @@ fn serve(
 
     let mut world = World {
         router,
+        this_computer: ThisComputer { name: local, displays, scales: local_scales, os: screen.os() },
         local_origin,
         arrangement,
         clients: Clients::new(),
@@ -292,8 +294,17 @@ fn serve(
 }
 
 /// Everything the event loop changes as things happen.
+/// What the clients are told about this computer when it sends them the layout.
+struct ThisComputer {
+    name: String,
+    displays: Vec<Rect>,
+    scales: Vec<u16>,
+    os: Os,
+}
+
 struct World<'a> {
     router: Router,
+    this_computer: ThisComputer,
     /// Where the corner of this computer's displays is in the system's coordinates.
     local_origin: (i32, i32),
     arrangement: Arrangement,
@@ -343,6 +354,48 @@ impl World<'_> {
         let actions = self.router.rebuild(&self.arrangement, &sizes);
         self.apply(actions);
         self.publish();
+        self.send_layout(&sizes);
+    }
+
+    /// Tells every client how the connected computers are laid out, with itself marked, so it
+    /// can show what the person arranged. Sent whenever the layout or who is connected changes.
+    fn send_layout(&self, connected: &BTreeMap<String, Vec<Rect>>) {
+        let metrics = Metrics {
+            this_computer: &self.this_computer.name,
+            local: &self.this_computer.displays,
+            devices: connected,
+        };
+        let desktop = self.arrangement.desktop_of(&metrics, |name| connected.contains_key(name));
+
+        for to in self.clients.keys() {
+            let screens: Vec<LayoutScreen> = desktop
+                .screens()
+                .iter()
+                .filter_map(|(name, displays)| {
+                    let all = connected_proto::bounds(displays)?;
+                    let (scales, os) = if *name == self.this_computer.name {
+                        (self.this_computer.scales.clone(), self.this_computer.os)
+                    } else {
+                        let client = self.clients.get(name)?;
+                        (client.scales.clone(), client.os)
+                    };
+                    Some(LayoutScreen {
+                        name: name.clone(),
+                        x: all.x,
+                        y: all.y,
+                        displays: displays.iter().map(|d| d.moved(-all.x, -all.y)).collect(),
+                        scales,
+                        os,
+                        you: name == to,
+                        online: true,
+                    })
+                })
+                .collect();
+            // A failure means the client thread just ended; its departure is reported separately.
+            if let Some(client) = self.clients.get(to) {
+                let _ = client.outgoing.send(Message::Layout { screens });
+            }
+        }
     }
 
     /// Makes what a screen can show match reality.

@@ -512,3 +512,32 @@ body.settings-open #nav, body.settings-open #statusbar { display: none; }
 }
 .group.in-selection, .group.marquee-hit { box-shadow: 0 0 0 1px var(--accent); }
 .space-pan .canvas { cursor: grab; }
+
+/* ---- the permission dialog ---- */
+
+.steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.step { display: flex; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); }
+.step.current { border-color: var(--accent); }
+.step.todo { opacity: 0.6; }
+.step .marker {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 13px;
+  background: color-mix(in srgb, var(--text) 12%, transparent);
+}
+.step.current .marker { background: var(--accent); color: #fff; }
+.step.done .marker { background: var(--good); color: #fff; }
+.step .marker .icon { color: #fff; }
+.step .body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.step .title { font-weight: 600; }
+.step .guide { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.step .guide p { margin: 0; }
+
+.hint-line { margin: 8px 0 0; user-select: text; -webkit-user-select: text; }
+.readonly { top: 14px; left: 14px; padding: 6px 12px; font-size: 12.5px; color: var(--muted); border-radius: 999px; }

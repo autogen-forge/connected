@@ -14,7 +14,7 @@ mod settings;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use client::{ClientHandle, ClientStatus, run_client};
+pub use client::{ClientHandle, ClientStatus, Hooks, run_client};
 pub use error::{AppError, Result};
 pub use pairing::{PairingEvent, PairingSession};
 pub use server::{ConnectedClient, ServerBackends, ServerHandle, ServerState};

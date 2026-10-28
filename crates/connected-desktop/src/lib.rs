@@ -25,12 +25,20 @@ use crate::state::AppState;
 /// The one command the window calls; see [`commands::dispatch`].
 #[tauri::command(async)]
 fn call(
+    app: tauri::AppHandle,
     cmd: String,
     args: Option<serde_json::Value>,
     state: tauri::State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     if std::env::var_os("CONNECTED_TRACE").is_some() {
         eprintln!("call {cmd}");
+    }
+    // Starting over is for the window itself to do, which is why it is not one of the commands
+    // the development server shares: macOS only gives a program the permissions it was just
+    // granted once it has started again. Sharing is stopped first, so that nothing is left held.
+    if cmd == "restart_app" {
+        state.shutdown();
+        app.restart();
     }
     commands::dispatch(&state, &cmd, args.unwrap_or(serde_json::Value::Null))
 }

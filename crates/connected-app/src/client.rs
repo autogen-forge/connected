@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use connected_core::platform::Result as PlatformResult;
 use connected_core::{InputSink, ScreenInfo, normalize};
 use connected_net::{NetError, Node, Session};
-use connected_proto::{ButtonState, Message, Modifiers};
+use connected_proto::{ButtonState, LayoutScreen, Message, Modifiers};
 
 use crate::error::Result;
 use crate::{HEARTBEAT_TIMEOUT, Log};
@@ -23,7 +23,14 @@ const WAIT_SLICE: Duration = Duration::from_millis(100);
 /// Connects to the server at `addr` and injects what it sends, until `stop` is set or the
 /// connection ends. Keys and buttons still held down are released on the way out.
 ///
-/// `on_connected` is called with the server's name once the link is up.
+/// What the client tells its owner as things happen.
+pub struct Hooks<'a> {
+    /// Called with the server's name once the link is up.
+    pub on_connected: &'a mut dyn FnMut(&str),
+    /// Called with the layout the server sends, now and whenever it changes.
+    pub on_layout: &'a mut dyn FnMut(Vec<LayoutScreen>),
+}
+
 pub fn run_client(
     node: &Node,
     addr: &str,
@@ -31,17 +38,17 @@ pub fn run_client(
     screen: &dyn ScreenInfo,
     stop: &AtomicBool,
     log: &Log,
-    on_connected: &mut dyn FnMut(&str),
+    hooks: Hooks<'_>,
 ) -> Result<()> {
     let mut session = node.connect(addr)?;
     log(&format!("connected to '{}'", session.peer().name));
-    on_connected(&session.peer().name);
+    (hooks.on_connected)(&session.peer().name);
 
     // The server measures from the corner of all the displays; the system, from the main one's.
     let (displays, origin) = normalize(&screen.displays()?);
     session.send(&Message::Screen { displays, scales: screen.scales()?, os: screen.os() })?;
 
-    let outcome = receive(&mut session, sink, origin, stop, log);
+    let outcome = receive(&mut session, sink, origin, stop, log, &mut *hooks.on_layout);
     if let Err(err) = sink.release_all() {
         log(&format!("cannot release held keys: {err}"));
     }
@@ -54,6 +61,7 @@ fn receive(
     origin: (i32, i32),
     stop: &AtomicBool,
     log: &Log,
+    on_layout: &mut dyn FnMut(Vec<LayoutScreen>),
 ) -> Result<()> {
     let mut last_heard = Instant::now();
     let mut reports = 0u32;
@@ -69,6 +77,8 @@ fn receive(
 
         if let Message::Ping(n) = message {
             session.send(&Message::Pong(n))?;
+        } else if let Message::Layout { screens } = message {
+            on_layout(screens);
         } else if let Err(err) = inject(&message, origin, sink) {
             reports += 1;
             if reports <= MAX_INJECTION_REPORTS {
@@ -125,6 +135,8 @@ pub enum ClientStatus {
 pub struct ClientHandle {
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<ClientStatus>>,
+    /// How the sharing computer says the computers are laid out, while connected.
+    layout: Arc<Mutex<Option<Vec<LayoutScreen>>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -142,9 +154,10 @@ impl ClientHandle {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(ClientStatus::Connecting));
+        let layout = Arc::new(Mutex::new(None));
 
         let thread = thread::spawn({
-            let (stop, status) = (Arc::clone(&stop), Arc::clone(&status));
+            let (stop, status, layout) = (Arc::clone(&stop), Arc::clone(&status), Arc::clone(&layout));
             move || {
                 let set = |next: ClientStatus| {
                     if let Ok(mut status) = status.lock() {
@@ -170,8 +183,21 @@ impl ClientHandle {
                         screen.as_ref(),
                         &stop,
                         &log,
-                        &mut |server| set(ClientStatus::Connected { server: server.to_owned() }),
+                        Hooks {
+                            on_connected: &mut |server| {
+                                set(ClientStatus::Connected { server: server.to_owned() });
+                            },
+                            on_layout: &mut |screens| {
+                                if let Ok(mut layout) = layout.lock() {
+                                    *layout = Some(screens);
+                                }
+                            },
+                        },
                     );
+                    // A layout belongs to the connection it came over.
+                    if let Ok(mut layout) = layout.lock() {
+                        *layout = None;
+                    }
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -191,7 +217,12 @@ impl ClientHandle {
             }
         });
 
-        Self { stop, status, thread: Some(thread) }
+        Self { stop, status, layout, thread: Some(thread) }
+    }
+
+    /// How the sharing computer says the computers are laid out, while connected to it.
+    pub fn layout(&self) -> Option<Vec<LayoutScreen>> {
+        self.layout.lock().ok().and_then(|layout| layout.clone())
     }
 
     pub fn status(&self) -> ClientStatus {

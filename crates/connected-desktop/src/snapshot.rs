@@ -36,6 +36,8 @@ pub struct Snapshot {
     pub client: Option<ClientView>,
     /// This computer's screen and the placed ones, on the shared desktop.
     pub screens: Vec<ScreenView>,
+    /// While receiving: the layout the sharing computer sent, to show. Empty otherwise.
+    pub remote_layout: Option<Vec<ScreenView>>,
     pub devices: Vec<DeviceView>,
     pub server_address: String,
     pub pairing: Option<PairingView>,
@@ -61,6 +63,8 @@ pub struct ScreenView {
     pub scales: Vec<u16>,
     /// The system it runs.
     pub os: Os,
+    /// Whether it is connected. This computer always is.
+    pub online: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +136,9 @@ pub fn snapshot(state: &AppState) -> Snapshot {
     let permissions = state.permissions();
     let mut model = state.model.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     model.tick();
+    if state.checks_permissions() {
+        model.note_permissions(permissions.iter().any(|permission| !permission.granted));
+    }
     build(&model, state.demo, permissions)
 }
 
@@ -145,6 +152,9 @@ fn build(
     let fingerprint = model.fingerprint();
     let systems = model.known_systems();
     let scales = model.known_scales();
+    let device_list = model.devices();
+    let devices_online: std::collections::HashMap<&str, bool> =
+        device_list.iter().map(|device| (device.name.as_str(), device.online)).collect();
 
     Snapshot {
         this_computer: model.this_computer().to_owned(),
@@ -199,12 +209,15 @@ fn build(
                     } else {
                         systems.get(name).copied().unwrap_or_default()
                     },
+                    online: name == model.this_computer()
+                        || devices_online.get(name.as_str()).copied().unwrap_or(false),
                 })
             })
             .collect(),
+        remote_layout: model.client_layout().map(|screens| screens.into_iter().filter_map(layout_view).collect()),
         devices: {
             let known = model.known_displays();
-            model.devices().into_iter().map(|device| device_view(device, &known, &systems)).collect()
+            device_list.iter().cloned().map(|device| device_view(device, &known, &systems)).collect()
         },
         server_address: model.settings.server_address.clone(),
         pairing: model.pairing.as_ref().map(|flow| pairing_view(&flow.stage)),
@@ -215,6 +228,24 @@ fn build(
             .collect(),
         logs: logs.into_iter().skip(skipped).collect(),
     }
+}
+
+/// A computer from the layout the sharing computer sent, as the window draws it.
+fn layout_view(screen: connected_proto::LayoutScreen) -> Option<ScreenView> {
+    let all = connected_proto::bounds(&screen.displays)?;
+    Some(ScreenView {
+        name: screen.name,
+        x: screen.x,
+        y: screen.y,
+        width: all.width,
+        height: all.height,
+        // "Local" is the computer this window belongs to, which the sender marked.
+        local: screen.you,
+        displays: screen.displays,
+        scales: screen.scales,
+        os: screen.os,
+        online: screen.online,
+    })
 }
 
 fn client_view(status: ClientStatus) -> ClientView {

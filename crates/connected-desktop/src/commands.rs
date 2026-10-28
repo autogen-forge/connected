@@ -61,7 +61,10 @@ pub fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value, S
         "close_pairing" => with_model(state, |model| model.close_pairing()),
         "dismiss_notice" => with_model(state, |model| model.notice = None),
         "request_permissions" => connected_platform::request_permissions(),
-        "open_privacy_settings" => open_privacy_settings(),
+        "open_privacy_settings" => {
+            let pane: Option<String> = args.get("pane").and_then(|value| value.as_str()).map(str::to_owned);
+            open_privacy_settings(pane.as_deref());
+        }
         other => return Err(format!("unknown command '{other}'")),
     }
     serde_json::to_value(snapshot(state)).map_err(|err| err.to_string())
@@ -83,13 +86,27 @@ fn position(args: &Value) -> Result<(i32, i32), String> {
     Ok((arg(args, "x")?, arg(args, "y")?))
 }
 
-fn open_privacy_settings() {
+/// The part of the privacy settings address that picks the page: `input_monitoring` is the
+/// Input Monitoring page, and anything else, `accessibility` included, is the Accessibility one.
+fn privacy_anchor(pane: Option<&str>) -> &'static str {
+    match pane {
+        Some("input_monitoring") => "Privacy_ListenEvent",
+        _ => "Privacy_Accessibility",
+    }
+}
+
+/// Opens the system settings at the page where the given permission is given.
+fn open_privacy_settings(pane: Option<&str>) {
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open")
-            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-            .spawn();
+        let url = format!(
+            "x-apple.systempreferences:com.apple.preference.security?{}",
+            privacy_anchor(pane)
+        );
+        let _ = std::process::Command::new("open").arg(url).spawn();
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = pane;
 }
 
 #[cfg(test)]
@@ -117,6 +134,14 @@ mod tests {
     }
 
     #[test]
+    fn each_permission_has_its_own_page_in_the_system_settings() {
+        assert_eq!(privacy_anchor(Some("accessibility")), "Privacy_Accessibility");
+        assert_eq!(privacy_anchor(Some("input_monitoring")), "Privacy_ListenEvent");
+        assert_eq!(privacy_anchor(None), "Privacy_Accessibility");
+        assert_eq!(privacy_anchor(Some("../../etc")), "Privacy_Accessibility", "only known pages are opened");
+    }
+
+    #[test]
     fn the_first_snapshot_describes_an_idle_computer() {
         let snapshot = call(&state(), "snapshot", json!({}));
         assert_eq!(snapshot["this_computer"], "desk");
@@ -130,6 +155,7 @@ mod tests {
                 "displays": [{ "x": 0, "y": 0, "width": 1920, "height": 1080 }],
                 "scales": [100],
                 "os": connected_core::Os::current(),
+                "online": true,
             }])
         );
         assert_eq!(snapshot["server"], Value::Null);

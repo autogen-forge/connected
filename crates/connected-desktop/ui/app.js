@@ -12,6 +12,9 @@ import {
   fitView,
   formatSize,
   isPlaced,
+  missingPanes,
+  permissionPane,
+  permissionSteps,
   monitorFacts,
   overlapRegions,
   panBy,
@@ -60,7 +63,40 @@ let pairAddress = ''; // what has been typed as the address to pair with
 let localError = null;
 let selection = new Set(); // the computers that are selected, by name
 let pickedMonitor = null; // which monitor of the only selected computer the person pressed
+// Giving the permissions the system asks for, step by step in a dialog. Once the last one is
+// given the program starts over, because the system only gives a program what it was granted
+// when it starts again.
+let wizardDismissed = false; // the person closed the dialog for now
+let wizardEngaged = false; // the person has opened a settings page from the dialog
+let wizardSeen = false; // the dialog has been shown, so giving the last permission ends in a restart
+const openedPanes = new Set(); // the settings pages the dialog has opened, so it does not open one twice
+let restartIn = null; // seconds until the restart, while counting down
+let restartTimer = null;
 let spaceDown = false; // while Space is held, dragging the canvas moves the view
+
+/**
+ * The computers on the layout: what this computer arranged when it shares, and what the
+ * sharing computer arranged (sent over, with this computer marked) when it receives.
+ */
+function layoutScreens() {
+  return snap.mode === 'receive' ? snap.remote_layout || [] : snap.screens;
+}
+
+/** What the layout calls this computer: the sharing computer may know it by another name. */
+function localName() {
+  const mine = layoutScreens().find((screen) => screen.local);
+  return mine ? mine.name : snap.this_computer;
+}
+
+/** The layout a receiving computer shows is the sharing computer's; it can only be looked at. */
+function layoutReadOnly() {
+  return snap.mode === 'receive';
+}
+
+/** Whether there is a layout to draw: always when sharing; when receiving, once one arrived. */
+function hasLayout() {
+  return snap.mode === 'share' || (snap.remote_layout || []).length > 0;
+}
 
 /** The computer whose monitors and details are shown: the one, when just one is selected. */
 function sole() {
@@ -145,6 +181,7 @@ function render() {
   renderStatusbar();
   renderOverlay();
   restoreFocus(focus);
+  driveWizard();
 }
 
 function rememberFocus() {
@@ -171,12 +208,13 @@ function renderStatusbar() {
     on: { click: () => act(snap.running ? 'stop' : 'start') },
   }, icon(snap.running ? 'stop' : 'play', 12, 'inline'), snap.running ? '중지' : '시작');
 
-  $('statusbar').replaceChildren(
+  $('statusbar').replaceChildren(...[
     ...items.map((item) => h('span', { class: `item tone-${item.tone}` },
       h('span', { class: 'dot' }), item.text)),
     h('span', { class: 'spacer' }),
-    address && h('span', { class: 'item muted', title: '다른 컴퓨터가 연결할 주소' }, '주소 ', h('code', { text: address })),
-    toggle);
+    address ? h('span', { class: 'item muted', title: '다른 컴퓨터가 연결할 주소' }, '주소 ', h('code', { text: address })) : null,
+    toggle,
+  ].filter(Boolean));
 }
 
 function renderBanners() {
@@ -198,10 +236,15 @@ function renderBanners() {
       h('div', { class: 'banner warn' },
         h('span', {
           class: 'text',
-          text: `키보드와 마우스를 다루려면 시스템 설정의 개인정보 보호 및 보안에서 이 앱에 권한이 필요합니다: ${missing.join(', ')}`,
+          text: `키보드와 마우스를 다루려면 시스템 설정의 개인정보 보호 및 보안에서 이 앱에 권한이 필요합니다: ${missing.join(', ')}. 허용했는데도 남아 있으면 앱을 완전히 종료(Cmd+Q)한 뒤 다시 여세요.`,
         }),
+        wizardDismissed && h('button', { text: '단계별 안내', on: { click: reopenWizard } }),
         h('button', { text: '권한 요청', on: { click: () => act('request_permissions') } }),
-        h('button', { text: '시스템 설정 열기', on: { click: () => act('open_privacy_settings') } })),
+        ...missingPanes(snap.permissions).map(({ pane, label }) => h('button', {
+          text: `${label} 열기`,
+          title: `시스템 설정의 ‘${label}’ 화면으로 이동`,
+          on: { click: () => act('open_privacy_settings', { pane }) },
+        }))),
     );
   }
 }
@@ -227,9 +270,9 @@ function renderTabs() {
 function renderView() {
   const view = $('view');
   // The layout fills the window; the other tabs sit in a padded page.
-  view.classList.toggle('full', (tab === 'layout' && snap.mode === 'share') || tab === 'settings');
+  view.classList.toggle('full', (tab === 'layout' && hasLayout()) || tab === 'settings');
   switch (tab) {
-    case 'layout': return snap.mode === 'share' ? layoutView(view) : receivingLayoutView(view);
+    case 'layout': return hasLayout() ? layoutView(view) : receivingLayoutView(view);
     case 'devices': return devicesView(view);
     case 'activity': return activityView(view);
     case 'settings': return settingsView(view);
@@ -279,6 +322,7 @@ function buildLayout() {
       h('button', { type: 'button', title: '축소', text: '−', on: { click: () => zoomBy(1 / 1.25) } }),
       h('button', { type: 'button', class: 'level', id: 'zoom-level', title: '전체가 보이게 맞추기', on: { click: fitAll } }),
       h('button', { type: 'button', title: '확대', text: '+', on: { click: () => zoomBy(1.25) } })),
+    layoutReadOnly() && h('div', { class: 'readonly float', text: '읽기 전용 · 공유하는 컴퓨터의 배치' }),
     h('div', { class: 'side' }, buildDetail()));
 }
 
@@ -298,6 +342,8 @@ const ICONS = {
   linux: '<ellipse cx="12" cy="14.8" rx="6.6" ry="8" fill="currentColor"/><circle cx="12" cy="6.6" r="4.3" fill="currentColor"/><ellipse cx="7.6" cy="22" rx="3.2" ry="1.7" fill="currentColor"/><ellipse cx="16.4" cy="22" rx="3.2" ry="1.7" fill="currentColor"/><ellipse cx="12" cy="16.2" rx="3.9" ry="5.6" class="cut"/><circle cx="10.4" cy="5.8" r="0.9" class="cut"/><circle cx="13.6" cy="5.8" r="0.9" class="cut"/><path d="M10.3 7.6l1.7 1.5 1.7-1.5-1.7-.7z" class="beak"/>',
   play: '<path d="M7 4.5v15l12-7.5z" fill="currentColor"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>',
+  check: '<path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>',
+  shield: '<path d="M12 2.5l8 3v6c0 4.7-3.2 8.4-8 10-4.8-1.6-8-5.3-8-10v-6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M8.5 12l2.5 2.5 4.5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
   close: '<path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>',
   plus: '<path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>',
   remove: '<circle cx="12" cy="12" r="9.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M7.5 12h9" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>',
@@ -401,12 +447,12 @@ function buildGroup(screen, view, at, options) {
 /** The view to draw with: what the person zoomed to, or everything fitted to the canvas. */
 function currentView(canvas) {
   const spare = snap.devices
-    .filter((device) => !isPlaced(snap.screens, device.name))
+    .filter((device) => !isPlaced(layoutScreens(), device.name))
     .map((device) => {
       const [w, h2] = boundsSize(device.displays);
       return { width: w, height: h2 };
     });
-  const fit = fitView(snap.screens, canvas.clientWidth, canvas.clientHeight, spare, FLOATING_INSETS);
+  const fit = fitView(layoutScreens(), canvas.clientWidth, canvas.clientHeight, spare, FLOATING_INSETS);
   return { fit, view: viewOverride || fit };
 }
 
@@ -417,15 +463,15 @@ function paintCanvas(canvas) {
   if (width === 0 || height === 0) return;
 
   const active = snap.server ? snap.server.active_screen : null;
-  const lost = new Set(unreachable(snap.screens, snap.this_computer));
+  const lost = new Set(unreachable(layoutScreens(), localName()));
   const { fit, view } = currentView(canvas);
   canvasState = { canvas, view, fit };
   const level = document.getElementById('zoom-level');
   if (level) level.textContent = `${Math.round((view.scale / fit.scale) * 100)}%`;
 
-  for (const edge of contactSegments(snap.screens)) canvas.append(linkBar(view, edge, ''));
+  for (const edge of contactSegments(layoutScreens())) canvas.append(linkBar(view, edge, ''));
 
-  for (const screen of snap.screens) {
+  for (const screen of layoutScreens()) {
     const tone = toneOf(screen);
     const warn = lost.has(screen.name);
     const expanded = sole() === screen.name;
@@ -446,8 +492,7 @@ function paintCanvas(canvas) {
 /** How a computer is shown: this one in blue, others green when connected and grey when not. */
 function toneOf(screen) {
   if (screen.local) return 'accent';
-  const device = snap.devices.find((candidate) => candidate.name === screen.name);
-  return device && device.online ? 'good' : 'off';
+  return screen.online ? 'good' : 'off';
 }
 
 /** Draws the canvas again without touching the rest of the page, for zooming and panning. */
@@ -551,7 +596,7 @@ function startSelecting(canvas, press) {
     };
     Object.assign(band.style, { left: `${rect.x}px`, top: `${rect.y}px`, width: `${rect.width}px`, height: `${rect.height}px` });
     const { view } = canvasState;
-    hits = snap.screens.filter((screen) => {
+    hits = layoutScreens().filter((screen) => {
       const at = toCanvas(view, screen.x, screen.y);
       return overlapRegions([rect], [{ x: at.x, y: at.y, width: screen.width * view.scale, height: screen.height * view.scale }]).length > 0;
     }).map((screen) => screen.name);
@@ -647,7 +692,7 @@ function deselect() {
 
 /** The card when several computers are selected: who they are, and that they move together. */
 function buildGroupDetail() {
-  const chosen = snap.screens.filter((screen) => selection.has(screen.name));
+  const chosen = layoutScreens().filter((screen) => selection.has(screen.name));
   return h('aside', { class: 'detail float' },
     h('div', { class: 'head' },
       h('h3', { text: `컴퓨터 ${chosen.length}대 선택됨` }),
@@ -663,7 +708,7 @@ function buildGroupDetail() {
  */
 function buildDetail() {
   if (selection.size > 1) return buildGroupDetail();
-  const screen = snap.screens.find((candidate) => candidate.name === sole());
+  const screen = layoutScreens().find((candidate) => candidate.name === sole());
   if (!screen) return null;
   const device = snap.devices.find((candidate) => candidate.name === screen.name);
   const active = snap.server ? snap.server.active_screen : null;
@@ -699,7 +744,7 @@ function buildDetail() {
     h('div', { class: 'head' },
       osMark(screen.os, 18),
       h('h3', { text: screen.name, title: screen.name }),
-      screen.local ? null : iconButton('remove', '배치에서 빼기', () => {
+      screen.local || layoutReadOnly() ? null : iconButton('remove', '배치에서 빼기', () => {
         deselect();
         act('remove_from_layout', { device: screen.name });
       }),
@@ -765,11 +810,11 @@ function beginDrag(event, source, name) {
   event.preventDefault();
 
   const { view } = canvasState;
-  const anchor = snap.screens.find((screen) => screen.name === name);
+  const anchor = layoutScreens().find((screen) => screen.name === name);
   if (!anchor) return;
-  const lost = new Set(unreachable(snap.screens, snap.this_computer));
+  const lost = new Set(unreachable(layoutScreens(), localName()));
   const chosen = selection.size > 1 && selection.has(name)
-    ? snap.screens.filter((screen) => selection.has(screen.name))
+    ? layoutScreens().filter((screen) => selection.has(screen.name))
     : [anchor];
   const members = chosen.map((screen) => carried(screen, anchor, lost));
   // The rectangle round all of them, from the pressed computer's corner.
@@ -830,7 +875,7 @@ function dropTarget(clientX, clientY) {
   }
 
   const names = new Set(drag.members.map((member) => member.name));
-  const others = snap.screens.filter((screen) => !names.has(screen.name));
+  const others = layoutScreens().filter((screen) => !names.has(screen.name));
   const pos = toDesktop(view, clientX - area.left - drag.grabX, clientY - area.top - drag.grabY);
   // They snap as one block, by the rectangle round all of them.
   const { union } = drag;
@@ -863,7 +908,7 @@ function drawPreview(target) {
 
   const names = new Set(drag.members.map((member) => member.name));
   const ghosts = drag.members.map((member) => ({ ...member, x: target.x + member.dx, y: target.y + member.dy }));
-  const others = snap.screens.filter((screen) => !names.has(screen.name));
+  const others = layoutScreens().filter((screen) => !names.has(screen.name));
   for (const edge of contactSegments([...ghosts, ...others])) {
     // Only where a carried computer meets one that stays.
     if (names.has(edge.a) !== names.has(edge.b)) canvas.append(linkBar(view, edge, 'preview'));
@@ -886,6 +931,8 @@ function drawPreview(target) {
 function onDragMove(event) {
   if (!drag) return;
   if (!drag.active) {
+    // A layout that is only looked at cannot be picked up; pressing and letting go still selects.
+    if (layoutReadOnly()) return;
     if (Math.hypot(event.clientX - drag.pressedAt.x, event.clientY - drag.pressedAt.y) < DRAG_START_PX) return;
     startCarrying();
   }
@@ -932,7 +979,7 @@ function onDragEnd(event) {
     render();
     return;
   }
-  const current = snap.screens.find((screen) => screen.name === name);
+  const current = layoutScreens().find((screen) => screen.name === name);
   const [dx, dy] = [target.x - current.x, target.y - current.y];
   if (dx === 0 && dy === 0) return;
 
@@ -960,13 +1007,13 @@ function onDragKey(event) {
 
 // ---- the other tabs ----
 
-/** In receive mode the layout belongs to the computer that shares, so there is nothing to place. */
+/** In receive mode the layout is the sharing computer's, and shows once this computer has connected to it. */
 function receivingLayoutView(view) {
   view.replaceChildren(h('section', { class: 'stack' },
     h('h2', { text: '레이아웃' }),
     h('p', {
       class: 'muted',
-      text: '이 컴퓨터는 다른 컴퓨터의 키보드와 마우스를 받는 쪽입니다. 화면 배치는 공유하는 컴퓨터에서 합니다. 이 컴퓨터를 공유하는 쪽으로 쓰려면 ‘설정’에서 바꾸세요.',
+      text: '이 컴퓨터는 다른 컴퓨터의 키보드와 마우스를 받는 쪽입니다. 화면 배치는 공유하는 컴퓨터에서 하고, 그 컴퓨터에 연결되면 여기에 같은 배치가 보입니다. 이 컴퓨터를 공유하는 쪽으로 쓰려면 ‘설정’에서 바꾸세요.',
     })));
   builtView = null;
 }
@@ -1058,18 +1105,31 @@ function permissionRows() {
     ...snap.permissions.map((permission) => h('div', { class: 'row perm' },
       h('span', { class: `dot ${permission.granted ? 'good' : 'warn'}` }),
       h('span', { class: 'name', text: permission.name }),
-      h('span', { class: 'muted', text: permission.granted ? '허용됨' : '허용 필요' }))),
+      h('span', { class: 'muted', text: permission.granted ? '허용됨' : '허용 필요' }),
+      permission.granted ? null : h('button', {
+        type: 'button',
+        class: 'small-btn',
+        text: '열기',
+        title: `시스템 설정의 ‘${permissionPane(permission.name).label}’ 화면으로 이동`,
+        on: { click: () => act('open_privacy_settings', { pane: permissionPane(permission.name).pane }) },
+      }))),
     missing
       ? h('div', { class: 'actions' },
+        h('button', { type: 'button', class: 'secondary', text: '단계별 안내', on: { click: () => { reopenWizard(); closeSettings(); } } }),
         h('button', { type: 'button', class: 'secondary', text: '권한 요청', on: { click: () => act('request_permissions') } }),
-        h('button', { type: 'button', class: 'secondary', text: '시스템 설정 열기', on: { click: () => act('open_privacy_settings') } }))
+        ...missingPanes(snap.permissions).map(({ pane, label }) => h('button', {
+          type: 'button',
+          class: 'secondary',
+          text: `${label} 열기`,
+          on: { click: () => act('open_privacy_settings', { pane }) },
+        })))
       : null,
   ].filter(Boolean);
 }
 
 /** The page chosen in the list on the left. */
 function settingsContent() {
-  const local = snap.screens.find((screen) => screen.local);
+  const local = layoutScreens().find((screen) => screen.local);
   switch (settingsPage) {
     case 'mode': {
       const modeButton = (mode, label) => h('button', {
@@ -1113,7 +1173,7 @@ function settingsContent() {
     case 'permissions':
       return [
         h('h2', { text: '권한' }),
-        h('p', { class: 'muted', text: '키보드와 마우스를 읽고 보내려면 운영체제의 허용이 필요합니다.' }),
+        h('p', { class: 'muted', text: '키보드와 마우스를 읽고 보내려면 운영체제의 허용이 필요합니다. 허용했는데도 ‘허용 필요’가 남아 있으면 앱을 완전히 종료(Cmd+Q)한 뒤 다시 여세요. 앱을 새로 빌드했다면 목록에서 Connected를 지우고 다시 추가해야 할 수도 있습니다.' }),
         h('div', { id: 'permissions', class: 'perms' }),
       ];
     case 'help':
@@ -1184,31 +1244,42 @@ function devicesView(view) {
 
 /** Puts a device on the layout, flush against the right side of what is there. */
 function addToLayout(device) {
-  const right = Math.max(...snap.screens.map((screen) => screen.x + screen.width));
-  const local = snap.screens.find((screen) => screen.local);
+  const right = Math.max(...layoutScreens().map((screen) => screen.x + screen.width));
+  const local = layoutScreens().find((screen) => screen.local);
   act('place_device', { device: device.name, x: right, y: local ? local.y : 0 });
 }
 
 function deviceCard(device) {
-  const placed = isPlaced(snap.screens, device.name);
-  return h('div', { class: 'card device-row' },
-    h('span', { class: `dot ${device.online ? 'good' : ''}` }),
-    osMark(device.os),
-    h('span', { class: 'name', text: device.name }),
-    h('span', { class: 'muted small', text: device.online ? '연결됨' : '오프라인' }),
-    h('code', { class: 'muted small grow', text: device.fingerprint_short }),
-    h('button', {
-      type: 'button',
-      class: 'small-btn',
-      text: placed ? '배치에서 빼기' : '배치에 추가',
-      on: { click: () => (placed ? act('remove_from_layout', { device: device.name }) : addToLayout(device)) },
-    }),
-    h('button', {
-      type: 'button',
-      class: 'small-btn bad',
-      text: '삭제',
-      on: { click: () => { forgetting = device.name; renderOverlay(); } },
-    }));
+  const placed = isPlaced(layoutScreens(), device.name);
+  const address = snap.server ? shareAddress(snap) : null;
+  // Paired is not connected: a computer is online only while it is connected to this one, which
+  // takes this computer to be running and the other to connect to it. Say so where it is missed.
+  let hint = null;
+  if (!device.online && snap.mode === 'share') {
+    hint = address
+      ? `이 컴퓨터는 접속을 기다리는 중입니다. 그 컴퓨터에서 ‘설정 → 사용 방식 → 다른 컴퓨터에서 받기’를 고르고, 주소 ${address} 를 입력한 뒤 ‘시작’을 누르세요.`
+      : '접속을 받으려면 먼저 아래 상태 표시줄의 ‘시작’을 누르세요.';
+  }
+  return h('div', { class: 'card' },
+    h('div', { class: 'device-row' },
+      h('span', { class: `dot ${device.online ? 'good' : ''}` }),
+      osMark(device.os),
+      h('span', { class: 'name', text: device.name }),
+      h('span', { class: 'muted small', text: device.online ? '연결됨' : '오프라인' }),
+      h('code', { class: 'muted small grow', text: device.fingerprint_short }),
+      h('button', {
+        type: 'button',
+        class: 'small-btn',
+        text: placed ? '배치에서 빼기' : '배치에 추가',
+        on: { click: () => (placed ? act('remove_from_layout', { device: device.name }) : addToLayout(device)) },
+      }),
+      h('button', {
+        type: 'button',
+        class: 'small-btn bad',
+        text: '삭제',
+        on: { click: () => { forgetting = device.name; renderOverlay(); } },
+      })),
+    hint && h('p', { class: 'muted small hint-line', text: hint }));
 }
 
 async function copyFingerprint() {
@@ -1231,12 +1302,12 @@ function activityView(view) {
 // ---- dialogs ----
 
 function renderOverlay() {
-  const key = JSON.stringify([snap.pairing, forgetting, snap.pairing_port]);
+  const key = JSON.stringify([snap.pairing, forgetting, snap.pairing_port, wizardShown(), snap.permissions, restartIn, [...openedPanes]]);
   if (key === overlayKey) return;
   overlayKey = key;
 
   const overlay = $('overlay');
-  const dialog = forgetting ? forgetDialog() : snap.pairing ? pairingDialog() : null;
+  const dialog = forgetting ? forgetDialog() : snap.pairing ? pairingDialog() : wizardShown() ? permissionDialog() : null;
   overlay.hidden = dialog === null;
   overlay.replaceChildren(...(dialog ? [dialog] : []));
 }
@@ -1256,6 +1327,131 @@ function forgetDialog() {
         on: { click: () => { close(); act('forget_device', { name }); } },
       }),
       h('button', { type: 'button', class: 'secondary', text: '취소', on: { click: close } })));
+}
+
+// ---- giving permissions ----
+
+/** Whether the permission dialog is on screen: while something is missing and the person has
+ * not put it off, and, once everything is given, while the program is about to start over. */
+function wizardShown() {
+  if (wizardDismissed || snap.permissions.length === 0) return false;
+  return permissionSteps(snap.permissions).current !== -1 || wizardSeen;
+}
+
+/**
+ * Moves the dialog along as the system reports permissions: once the person has begun, each
+ * next page of the settings opens by itself when the one before is done, and when the last
+ * permission is given a countdown to starting over begins.
+ */
+function driveWizard() {
+  if (!snap || snap.permissions.length === 0) return;
+  const { steps, current } = permissionSteps(snap.permissions);
+  if (current !== -1) {
+    cancelRestart();
+    if (!wizardDismissed) wizardSeen = true;
+    const step = steps[current];
+    if (wizardEngaged && !wizardDismissed && !openedPanes.has(step.pane)) {
+      openedPanes.add(step.pane);
+      api('open_privacy_settings', { pane: step.pane }).catch(() => {});
+    }
+  } else if (wizardSeen && !wizardDismissed && restartIn === null) {
+    startRestart();
+  }
+}
+
+function startRestart() {
+  restartIn = 3;
+  restartTimer = setInterval(() => {
+    restartIn -= 1;
+    if (restartIn <= 0) {
+      cancelRestart();
+      restartApp();
+    } else {
+      renderOverlay();
+    }
+  }, 1000);
+  renderOverlay();
+}
+
+function cancelRestart() {
+  if (restartTimer !== null) clearInterval(restartTimer);
+  restartTimer = null;
+  restartIn = null;
+}
+
+async function restartApp() {
+  cancelRestart();
+  try {
+    // The program starts over, so this normally never answers.
+    await api('restart_app');
+  } catch (error) {
+    wizardDismissed = true;
+    localError = `앱을 다시 시작하지 못했습니다: ${error}. 직접 종료(Cmd+Q)한 뒤 다시 여세요.`;
+    render();
+  }
+}
+
+/** Puts the dialog off; the banner at the top stays and can bring it back. */
+function laterWizard() {
+  wizardDismissed = true;
+  cancelRestart();
+  render();
+}
+
+function reopenWizard() {
+  wizardDismissed = false;
+  wizardEngaged = false;
+  openedPanes.clear();
+  render();
+}
+
+function permissionDialog() {
+  const { steps, current } = permissionSteps(snap.permissions);
+  const later = h('button', { type: 'button', class: 'secondary', text: '나중에', on: { click: laterWizard } });
+  const head = h('div', { class: 'dialog-head' },
+    icon('shield', 18, 'inline'),
+    h('h3', { text: '권한 설정' }),
+    iconButton('close', '나중에', laterWizard));
+
+  if (current === -1) {
+    return h('div', { class: 'dialog add' }, head,
+      h('p', { class: 'ok', text: '모든 권한이 확인되었습니다.' }),
+      h('p', {
+        text: restartIn === null
+          ? '적용하려면 앱을 다시 시작해야 합니다.'
+          : `적용하려면 앱을 다시 시작해야 합니다. ${restartIn}초 뒤에 자동으로 다시 시작합니다.`,
+      }),
+      h('div', { class: 'actions' },
+        h('button', { type: 'button', class: 'primary', text: '지금 다시 시작', on: { click: restartApp } }),
+        later));
+  }
+
+  const list = h('ol', { class: 'steps' }, steps.map((step, index) => {
+    const state = step.done ? 'done' : index === current ? 'current' : 'todo';
+    return h('li', { class: `step ${state}` },
+      h('span', { class: 'marker' }, step.done ? icon('check', 14, 'inline') : String(index + 1)),
+      h('div', { class: 'body' },
+        h('div', { class: 'title', text: `‘${step.label}’ 허용` }),
+        h('div', { class: 'muted small', text: step.names.join(', ') }),
+        state === 'current' && h('div', { class: 'guide' },
+          h('p', {
+            class: 'small',
+            text: `시스템 설정이 열리면 ‘${step.label}’ 목록에서 Connected를 켜세요. 목록에 없으면 아래의 + 버튼으로 추가합니다. 허용하면 이 창이 자동으로 다음 단계로 넘어갑니다.`,
+          }),
+          h('div', { class: 'actions' },
+            h('button', {
+              type: 'button',
+              class: 'primary',
+              text: `‘${step.label}’ 설정 열기`,
+              on: { click: () => { wizardEngaged = true; openedPanes.add(step.pane); act('open_privacy_settings', { pane: step.pane }); } },
+            }),
+            h('button', { type: 'button', class: 'secondary', text: '권한 요청', on: { click: () => act('request_permissions') } })))));
+  }));
+
+  return h('div', { class: 'dialog add' }, head,
+    h('p', { class: 'muted', text: '키보드와 마우스를 공유하려면 macOS의 허용이 필요합니다. 순서대로 하나씩 허용해 주세요. 마지막 권한까지 확인되면 앱이 다시 시작됩니다.' }),
+    list,
+    h('div', { class: 'actions' }, later));
 }
 
 // ---- adding a computer ----
