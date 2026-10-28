@@ -7,11 +7,11 @@
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use connected_core::platform::{PlatformError, Result};
 use connected_core::{InputEvent, InputSource};
@@ -49,9 +49,24 @@ struct Shared {
 
 static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
 
-/// Whether raw input has ever delivered mouse movement. If it has not, the hook's own
+/// When raw input last delivered mouse movement, in milliseconds since the first call (0 for
+/// never). While it is recent, it is what reports movement. When it is not, the hook's own
 /// positions stand in for it: they miss a push against a screen edge, but moving still works.
-static RAW_SEEN: AtomicBool = AtomicBool::new(false);
+static LAST_RAW_MS: AtomicU64 = AtomicU64::new(0);
+static RAW_MOVES: AtomicU64 = AtomicU64::new(0);
+static HOOK_MOVES: AtomicU64 = AtomicU64::new(0);
+/// How long after raw input's last movement the hook's positions are still left out.
+const RAW_RECENT_MS: u64 = 150;
+
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+fn raw_is_recent() -> bool {
+    let last = LAST_RAW_MS.load(Ordering::Relaxed);
+    last != 0 && now_ms().saturating_sub(last) < RAW_RECENT_MS
+}
 static LAST_HOOK_X: AtomicI32 = AtomicI32::new(i32::MIN);
 static LAST_HOOK_Y: AtomicI32 = AtomicI32::new(i32::MIN);
 
@@ -123,11 +138,11 @@ impl InputSource for WinSource {
     }
 
     fn describe(&self) -> String {
-        if RAW_SEEN.load(Ordering::Relaxed) {
-            "mouse movement from raw input".into()
-        } else {
-            "mouse movement from hook positions (raw input has not delivered; pushes against a screen edge are missed)".into()
-        }
+        format!(
+            "mouse movement: {} from raw input, {} from hook positions",
+            RAW_MOVES.load(Ordering::Relaxed),
+            HOOK_MOVES.load(Ordering::Relaxed)
+        )
     }
 
     fn set_capture(&mut self, capture: bool) -> Result<()> {
@@ -296,7 +311,8 @@ unsafe fn read_raw_input(handle: HRAWINPUT) {
             return;
         }
         if mouse.lLastX != 0 || mouse.lLastY != 0 {
-            RAW_SEEN.store(true, Ordering::Relaxed);
+            LAST_RAW_MS.store(now_ms(), Ordering::Relaxed);
+            RAW_MOVES.fetch_add(1, Ordering::Relaxed);
             report(InputEvent::MouseMove { dx: mouse.lLastX, dy: mouse.lLastY });
         }
     }
@@ -357,7 +373,8 @@ fn mouse_event(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
         WM_MOUSEMOVE => {
             let (x, y) = (info.pt.x, info.pt.y);
             let (last_x, last_y) = (LAST_HOOK_X.swap(x, Ordering::Relaxed), LAST_HOOK_Y.swap(y, Ordering::Relaxed));
-            if !RAW_SEEN.load(Ordering::Relaxed) && last_x != i32::MIN && (x != last_x || y != last_y) {
+            if !raw_is_recent() && last_x != i32::MIN && (x != last_x || y != last_y) {
+                HOOK_MOVES.fetch_add(1, Ordering::Relaxed);
                 report(InputEvent::MouseMove { dx: x - last_x, dy: y - last_y })
             } else {
                 with_shared(|shared| shared.capture).unwrap_or(false)

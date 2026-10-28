@@ -58,6 +58,8 @@ const INBOUND_WAIT: Duration = Duration::from_millis(2);
 const DEAF_AFTER: Duration = Duration::from_secs(15);
 /// How often the log shows where the mouse is while it moves on this computer.
 const TRACE_EVERY: Duration = Duration::from_secs(2);
+/// How often the log says whether the loop is alive and how much input it has read.
+const HEARTBEAT: Duration = Duration::from_secs(10);
 const PING_EVERY: Duration = Duration::from_secs(2);
 /// Larger than any real display; keeps absurd announcements out of the layout maths.
 const MAX_SCREEN_SIDE: i32 = 100_000;
@@ -734,6 +736,8 @@ fn event_loop(
     let mut warned_deaf = false;
     let started = Instant::now();
     let mut last_trace: Option<Instant> = None;
+    let mut last_beat = Instant::now();
+    let mut read_since_beat = 0u32;
     (world.log)(&format!(
         "mesh started, build {} {}",
         option_env!("GITHUB_REF_NAME").unwrap_or("local"),
@@ -749,6 +753,20 @@ fn event_loop(
                 world.on_command(command);
             }
 
+            if last_beat.elapsed() > HEARTBEAT {
+                last_beat = Instant::now();
+                (world.log)(&format!(
+                    "alive: {read_since_beat} input events in {}s, real cursor {:?}, counted at {:?}, on '{}', controlled by {:?}; {}",
+                    HEARTBEAT.as_secs(),
+                    world.screen.cursor().ok(),
+                    world.router.position(),
+                    world.router.active_screen(),
+                    world.controlled_by,
+                    world.source.describe(),
+                ));
+                read_since_beat = 0;
+            }
+
             let Some(input) = world.source.next_event_timeout(INPUT_POLL)? else {
                 if !heard_input && !warned_deaf && started.elapsed() > DEAF_AFTER {
                     warned_deaf = true;
@@ -756,6 +774,7 @@ fn event_loop(
                 }
                 continue;
             };
+            read_since_beat += 1;
             if !heard_input {
                 heard_input = true;
                 (world.log)("this computer's input is being read");
