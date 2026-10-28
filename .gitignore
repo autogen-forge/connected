@@ -1,0 +1,5 @@
+/target
+node_modules
+# Written by the Tauri build; recreated each time.
+crates/connected-desktop/gen/
+.DS_Store

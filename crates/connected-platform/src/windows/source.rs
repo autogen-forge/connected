@@ -1,0 +1,353 @@
+//! Input capture: low-level hooks see keys and buttons and can swallow them; raw input gives
+//! the mouse's movement, which keeps coming when the cursor is held against a screen edge.
+//!
+//! The hooks and the window that receives raw input live on one thread of their own, which runs
+//! a message loop. They report to a channel, and `WinSource` reads from it.
+
+use std::ffi::c_void;
+use std::mem::{size_of, zeroed};
+use std::ptr::{null, null_mut};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Mutex;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use connected_core::platform::{PlatformError, Result};
+use connected_core::{InputEvent, InputSource};
+use connected_proto::{ButtonState, MouseButton};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::Input::{
+    GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+    RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
+    MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, XBUTTON1,
+};
+
+use crate::winkeys;
+
+/// How long opening the capture waits for the hook thread to say it is ready.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What the hook functions, which Windows calls with no way to pass anything in, share with
+/// the rest of the program. There is one capture at a time.
+struct Shared {
+    events: Sender<InputEvent>,
+    /// While set, mouse buttons, keys and cursor movement are swallowed: they reach
+    /// `next_event_timeout` but not the programs on this computer.
+    capture: bool,
+}
+
+static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
+
+fn with_shared<R>(action: impl FnOnce(&mut Shared) -> R) -> Option<R> {
+    let mut guard = SHARED.lock().ok()?;
+    guard.as_mut().map(action)
+}
+
+/// Reports an event and says whether it should be swallowed.
+fn report(event: InputEvent) -> bool {
+    with_shared(|shared| {
+        let _ = shared.events.send(event);
+        shared.capture
+    })
+    .unwrap_or(false)
+}
+
+pub struct WinSource {
+    events: Receiver<InputEvent>,
+    thread_id: u32,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl WinSource {
+    pub fn open() -> Result<Self> {
+        let (events, receiver) = mpsc::channel();
+        {
+            let mut shared = SHARED.lock().map_err(|_| PlatformError::Other("capture state is poisoned".into()))?;
+            if shared.is_some() {
+                return Err(PlatformError::Other("input is already being captured".into()));
+            }
+            *shared = Some(Shared { events, capture: false });
+        }
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("connected-windows-hooks".into())
+            .spawn(move || hook_thread(&ready_tx))
+            .map_err(|err| PlatformError::Other(format!("cannot start the capture thread: {err}")))?;
+
+        match ready_rx.recv_timeout(READY_TIMEOUT) {
+            Ok(Ok(thread_id)) => Ok(Self { events: receiver, thread_id, thread: Some(thread) }),
+            Ok(Err(message)) => {
+                let _ = thread.join();
+                clear_shared();
+                Err(PlatformError::Other(message))
+            }
+            Err(_) => {
+                clear_shared();
+                Err(PlatformError::Other("the capture thread did not start".into()))
+            }
+        }
+    }
+}
+
+fn clear_shared() {
+    if let Ok(mut shared) = SHARED.lock() {
+        *shared = None;
+    }
+}
+
+impl InputSource for WinSource {
+    fn next_event_timeout(&mut self, timeout: Duration) -> Result<Option<InputEvent>> {
+        match self.events.recv_timeout(timeout) {
+            Ok(event) => Ok(Some(event)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(PlatformError::Other("input capture stopped".into())),
+        }
+    }
+
+    fn set_capture(&mut self, capture: bool) -> Result<()> {
+        with_shared(|shared| shared.capture = capture)
+            .ok_or_else(|| PlatformError::Other("input capture stopped".into()))
+    }
+}
+
+impl Drop for WinSource {
+    fn drop(&mut self) {
+        // Let go of everything first, then end the message loop of the hook thread.
+        let _ = with_shared(|shared| shared.capture = false);
+        // SAFETY: a plain call; if the thread is already gone it simply fails.
+        unsafe {
+            PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        clear_shared();
+    }
+}
+
+// ---- the hook thread ----
+
+/// Installs the hooks and the raw input window, tells `ready` the thread's id, and runs the
+/// message loop until `WM_QUIT`.
+fn hook_thread(ready: &Sender<std::result::Result<u32, String>>) {
+    // SAFETY: Win32 calls made in the order and with the arguments the API describes; every
+    // handle created here is released before the thread ends.
+    unsafe {
+        let module = GetModuleHandleW(null());
+        let keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), module, 0);
+        let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0);
+        if keyboard.is_null() || mouse.is_null() {
+            unhook(keyboard);
+            unhook(mouse);
+            let _ = ready.send(Err("Windows would not install the input hooks".into()));
+            return;
+        }
+
+        let window = match create_raw_input_window(module) {
+            Ok(window) => window,
+            Err(message) => {
+                unhook(keyboard);
+                unhook(mouse);
+                let _ = ready.send(Err(message));
+                return;
+            }
+        };
+
+        let _ = ready.send(Ok(GetCurrentThreadId()));
+
+        let mut message: MSG = zeroed();
+        while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+
+        unhook(keyboard);
+        unhook(mouse);
+        DestroyWindow(window);
+    }
+}
+
+/// # Safety
+/// `hook` is null or a hook from `SetWindowsHookExW` that is not yet removed.
+unsafe fn unhook(hook: HHOOK) {
+    if !hook.is_null() {
+        // SAFETY: as the caller promises.
+        unsafe {
+            UnhookWindowsHookEx(hook);
+        }
+    }
+}
+
+/// A window that is never shown and only receives raw mouse input, even when another
+/// program is in front.
+///
+/// # Safety
+/// `module` is this program's module handle.
+unsafe fn create_raw_input_window(
+    module: windows_sys::Win32::Foundation::HINSTANCE,
+) -> std::result::Result<HWND, String> {
+    let class_name: Vec<u16> = "ConnectedRawInput".encode_utf16().chain(Some(0)).collect();
+    let class = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(window_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: module,
+        hIcon: null_mut(),
+        hCursor: null_mut(),
+        hbrBackground: null_mut(),
+        lpszMenuName: null(),
+        lpszClassName: class_name.as_ptr(),
+    };
+    // SAFETY: `class` and the name it points to are valid for these calls. Registering a
+    // class that already exists fails, which is fine: the window can still be made with it.
+    unsafe {
+        RegisterClassW(&class);
+        let window = CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            class_name.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            null_mut(),
+            module,
+            null(),
+        );
+        if window.is_null() {
+            return Err("Windows would not create the window that receives mouse movement".into());
+        }
+        let device = RAWINPUTDEVICE {
+            usUsagePage: 0x01, // generic desktop
+            usUsage: 0x02,     // mouse
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: window,
+        };
+        if RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) == 0 {
+            DestroyWindow(window);
+            return Err("Windows would not deliver raw mouse input".into());
+        }
+        Ok(window)
+    }
+}
+
+unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if message == WM_INPUT {
+        // SAFETY: for `WM_INPUT`, `lparam` is the handle of raw input data.
+        unsafe { read_raw_input(lparam as HRAWINPUT) };
+    }
+    // SAFETY: the arguments are those Windows passed in.
+    unsafe { DefWindowProcW(window, message, wparam, lparam) }
+}
+
+/// Turns raw mouse movement into an event. Windows keeps it coming when the cursor is stopped
+/// at a screen edge, which the position the hooks report would not.
+///
+/// # Safety
+/// `handle` is the handle from a `WM_INPUT` message.
+unsafe fn read_raw_input(handle: HRAWINPUT) {
+    // SAFETY: RAWINPUT is plain data, and the size and header size passed are those of the types.
+    unsafe {
+        let mut raw: RAWINPUT = zeroed();
+        let mut size = size_of::<RAWINPUT>() as u32;
+        let read = GetRawInputData(
+            handle,
+            RID_INPUT,
+            &mut raw as *mut RAWINPUT as *mut c_void,
+            &mut size,
+            size_of::<RAWINPUTHEADER>() as u32,
+        );
+        if read == u32::MAX || raw.header.dwType != RIM_TYPEMOUSE {
+            return;
+        }
+        let mouse = raw.data.mouse;
+        // Devices that report where they are, not how far they moved, are left to the hooks.
+        if mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0 {
+            return;
+        }
+        if mouse.lLastX != 0 || mouse.lLastY != 0 {
+            report(InputEvent::MouseMove { dx: mouse.lLastX, dy: mouse.lLastY });
+        }
+    }
+}
+
+// ---- the hooks ----
+
+unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 {
+        // SAFETY: for the keyboard hook, `lparam` points to a KBDLLHOOKSTRUCT.
+        let info = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+        // Keys this program sent itself are left alone.
+        if info.flags & LLKHF_INJECTED == 0 {
+            let state = match wparam as u32 {
+                WM_KEYDOWN | WM_SYSKEYDOWN => Some(ButtonState::Down),
+                WM_KEYUP | WM_SYSKEYUP => Some(ButtonState::Up),
+                _ => None,
+            };
+            if let Some(state) = state {
+                let extended = info.flags & LLKHF_EXTENDED != 0;
+                let swallow = match winkeys::hid_from_scan(info.scanCode as u16, extended) {
+                    Some(usage) => report(InputEvent::Key { usage, state }),
+                    // A key with no usage cannot be sent on, but it must not leak either.
+                    None => with_shared(|shared| shared.capture).unwrap_or(false),
+                };
+                if swallow {
+                    return 1;
+                }
+            }
+        }
+    }
+    // SAFETY: passing the arguments on, as a hook should.
+    unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
+}
+
+unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 {
+        // SAFETY: for the mouse hook, `lparam` points to a MSLLHOOKSTRUCT.
+        let info = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
+        if info.flags & LLMHF_INJECTED == 0 && mouse_event(wparam as u32, info) {
+            return 1;
+        }
+    }
+    // SAFETY: passing the arguments on, as a hook should.
+    unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
+}
+
+/// Reports a mouse message and says whether to swallow it. Movement is reported by raw input,
+/// so here it is only swallowed, while capturing.
+fn mouse_event(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
+    let button = |button, state| report(InputEvent::MouseButton { button, state });
+    // The high word of `mouseData` says which extra button, or how far the wheel turned.
+    let high = (info.mouseData >> 16) as u16;
+    let extra = if high == XBUTTON1 { MouseButton::Back } else { MouseButton::Forward };
+    let wheel = i32::from(high as i16);
+
+    match message {
+        WM_MOUSEMOVE => with_shared(|shared| shared.capture).unwrap_or(false),
+        WM_LBUTTONDOWN => button(MouseButton::Left, ButtonState::Down),
+        WM_LBUTTONUP => button(MouseButton::Left, ButtonState::Up),
+        WM_RBUTTONDOWN => button(MouseButton::Right, ButtonState::Down),
+        WM_RBUTTONUP => button(MouseButton::Right, ButtonState::Up),
+        WM_MBUTTONDOWN => button(MouseButton::Middle, ButtonState::Down),
+        WM_MBUTTONUP => button(MouseButton::Middle, ButtonState::Up),
+        WM_XBUTTONDOWN => button(extra, ButtonState::Down),
+        WM_XBUTTONUP => button(extra, ButtonState::Up),
+        WM_MOUSEWHEEL => report(InputEvent::Wheel { dx: 0, dy: wheel }),
+        WM_MOUSEHWHEEL => report(InputEvent::Wheel { dx: wheel, dy: 0 }),
+        _ => false,
+    }
+}

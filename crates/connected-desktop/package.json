@@ -1,0 +1,14 @@
+{
+  "name": "connected-desktop",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test ui",
+    "tauri": "tauri",
+    "dev": "tauri dev -- -- --demo",
+    "build": "tauri build --bundles app"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

@@ -1,0 +1,40 @@
+[package]
+name = "connected-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The Connected desktop app"
+
+[lib]
+name = "connected_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "connected-desktop"
+path = "src/main.rs"
+
+[features]
+# Serve the pages from disk to a normal browser, with the same commands the window has. For
+# trying the screens without a window; never part of a release.
+dev-server = ["dep:tiny_http"]
+# Embeds the pages in the program instead of loading them from a development address. Tauri's
+# own command line tool turns this on for release builds; without that tool, it is on by
+# default.
+custom-protocol = ["tauri/custom-protocol"]
+default = ["custom-protocol"]
+
+[dependencies]
+connected-app.workspace = true
+connected-core.workspace = true
+connected-net.workspace = true
+connected-platform.workspace = true
+connected-proto.workspace = true
+dirs = "6"
+gethostname = "1"
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+tiny_http = { version = "0.12", optional = true }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

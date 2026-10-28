@@ -1,0 +1,10 @@
+{
+  "name": "connected",
+  "private": true,
+  "workspaces": ["crates/connected-desktop"],
+  "scripts": {
+    "test": "bun run --cwd crates/connected-desktop test",
+    "dev": "bun run --cwd crates/connected-desktop dev",
+    "build": "bun run --cwd crates/connected-desktop build"
+  }
+}

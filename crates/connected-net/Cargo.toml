@@ -1,0 +1,12 @@
+[package]
+name = "connected-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+connected-proto.workspace = true
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sha2 = "0.10"
+thiserror.workspace = true

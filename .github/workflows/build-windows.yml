@@ -1,0 +1,71 @@
+# Windows용 설치 파일(.exe)과 단독 실행 파일, 명령줄 도구를 빌드합니다.
+# 사용: GitHub 저장소 → Actions 탭 → "Build Windows" → Run workflow
+#       완료 후 실행 결과 페이지 하단 Artifacts의 "connected-windows" 다운로드
+# 태그(v*)를 푸시하면 자동 실행되고, 같은 이름 Release에 파일이 첨부됩니다.
+# 테스트 빌드: test-* 태그(예: test-1)를 푸시하면 같은 방식으로 빌드되고 '시험판(pre-release)'으로 올라갑니다.
+name: Build Windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*", "test-*"]
+
+permissions:
+  contents: write   # 태그 푸시 시 Release 생성에 필요
+
+jobs:
+  build:
+    runs-on: [self-hosted, windows, x64]   # 내 Windows 러너에서만 빌드한다 (warframe-guidance 와 같은 방식)
+    timeout-minutes: 60
+    steps:
+      - name: 소스 받기
+        uses: actions/checkout@v4
+
+      - name: Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust 빌드 캐시
+        uses: swatinem/rust-cache@v2
+
+      - name: 의존성 설치
+        run: bun install --frozen-lockfile
+
+      - name: 화면 로직 테스트
+        run: bun run test
+
+      - name: 단위·통합 테스트 (Rust)
+        run: cargo test --workspace
+
+      - name: Tauri 빌드 (NSIS 설치 파일)
+        run: bun run --cwd crates/connected-desktop tauri build --bundles nsis
+
+      - name: 명령줄 도구 빌드
+        run: cargo build --release -p connected-cli
+
+      - name: 산출물 이름 고정
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/bundle/nsis/*-setup.exe dist/Connected-setup.exe
+          cp target/release/connected-desktop.exe dist/Connected-portable.exe
+          cp target/release/connected.exe dist/connected-cli.exe
+          sha256sum dist/*
+          ls -la dist/
+
+      - name: 산출물 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: connected-windows
+          if-no-files-found: error
+          path: dist/*.exe
+
+      - name: Release에 첨부 (태그 푸시일 때만, test-* 는 시험판으로)
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/test-')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ startsWith(github.ref_name, 'test-') }}
+          name: ${{ github.ref_name }}
+          files: dist/*.exe

@@ -1,0 +1,21 @@
+[package]
+name = "connected-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "connected"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+connected-app.workspace = true
+connected-core.workspace = true
+connected-net.workspace = true
+connected-platform.workspace = true
+connected-proto.workspace = true
+ctrlc = { version = "3", features = ["termination"] }
+dirs = "6"
+gethostname = "1"
