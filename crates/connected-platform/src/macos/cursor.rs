@@ -49,6 +49,24 @@ impl HiddenCursor {
         self.hidden = CGDisplay::main().hide_cursor().is_ok();
     }
 
+    /// Makes the cursor visible even if something other than this process hid it, or an earlier
+    /// hide was never undone. Says whether it is visible afterwards.
+    pub fn ensure_visible(&mut self) -> bool {
+        if is_visible() {
+            return true;
+        }
+        let display = CGDisplay::main();
+        for _ in 0..MAX_SHOWS {
+            let _ = display.show_cursor();
+            sleep(SHOW_SETTLE);
+            if is_visible() {
+                self.hidden = false;
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn show(&mut self) {
         if !self.hidden {
             return;

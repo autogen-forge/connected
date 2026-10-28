@@ -191,6 +191,10 @@ impl InputSource for MacSource {
 
     fn set_blocking(&mut self, block: bool) -> Result<()> {
         self.block(block);
+        // The other computer's mouse moves this cursor, so it has to be seen.
+        if block && !self.cursor.ensure_visible() {
+            return Err(PlatformError::Other("the cursor stays hidden".into()));
+        }
         Ok(())
     }
 }

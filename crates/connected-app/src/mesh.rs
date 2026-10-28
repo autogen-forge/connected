@@ -613,6 +613,12 @@ impl World<'_> {
         self.block(true);
         let message = Message::Enter { x, y, seq: 0, modifiers };
         self.inject(&message);
+        (self.log)(&format!(
+            "cursor asked for ({}, {}), is at {:?}",
+            x + self.local_origin.0,
+            y + self.local_origin.1,
+            self.screen.cursor().ok()
+        ));
         self.publish();
     }
 
