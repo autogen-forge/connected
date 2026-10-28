@@ -8,10 +8,11 @@ use connected_proto::{ButtonState, MouseButton};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
     KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{SetCursorPos, XBUTTON1, XBUTTON2};
+use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos, XBUTTON1, XBUTTON2};
 
 use crate::winkeys;
 
@@ -95,7 +96,14 @@ impl InputSink for WinSink {
     }
 
     fn move_rel(&mut self, dx: i32, dy: i32) -> Result<()> {
-        send(mouse(dx, dy, 0, MOUSEEVENTF_MOVE))
+        // A relative `SendInput` move goes through pointer acceleration, which would stretch the
+        // other computer's movement; placing the cursor does not.
+        let mut at = POINT { x: 0, y: 0 };
+        // SAFETY: `at` is valid for writes.
+        if unsafe { GetCursorPos(&mut at) } == 0 {
+            return Err(PlatformError::Other("Windows could not read the cursor position".into()));
+        }
+        self.move_abs(at.x + dx, at.y + dy)
     }
 
     fn button(&mut self, button: MouseButton, state: ButtonState) -> Result<()> {

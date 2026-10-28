@@ -54,6 +54,13 @@ pub trait InputSource: Send {
     /// While capturing, events reach `next_event` but not the local desktop.
     fn set_capture(&mut self, capture: bool) -> Result<()>;
 
+    /// Keeps this computer's own keyboard and mouse from reaching its programs while another
+    /// computer controls it. Unlike [`set_capture`](Self::set_capture) the cursor stays where it
+    /// is and visible, because the other computer's mouse is moving it.
+    fn set_blocking(&mut self, block: bool) -> Result<()> {
+        self.set_capture(block)
+    }
+
     /// How this source is reading input, for the log when something does not work.
     fn describe(&self) -> String {
         String::new()

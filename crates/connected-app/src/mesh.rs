@@ -437,6 +437,15 @@ impl World<'_> {
         }
     }
 
+    /// Keeps this computer's own input out of the way while another one controls it. The cursor
+    /// stays visible: the other computer's mouse is moving it.
+    fn block(&mut self, on: bool) {
+        if let Err(err) = self.source.set_blocking(on) {
+            let how = if on { "on" } else { "off" };
+            (self.log)(&format!("cannot switch input blocking {how}: {err}"));
+        }
+    }
+
     fn capture(&mut self, on: bool) {
         if let Err(err) = self.source.set_capture(on) {
             let how = if on { "on" } else { "off" };
@@ -601,7 +610,7 @@ impl World<'_> {
         }
         (self.log)(&format!("'{from}' took control of this computer"));
         self.controlled_by = Some(from.to_owned());
-        self.capture(true);
+        self.block(true);
         let message = Message::Enter { x, y, seq: 0, modifiers };
         self.inject(&message);
         self.publish();
@@ -627,7 +636,7 @@ impl World<'_> {
         if let Err(err) = self.sink.release_all() {
             (self.log)(&format!("cannot release held keys: {err}"));
         }
-        self.capture(false);
+        self.block(false);
         // The cursor moved while it was controlled; the router has to start from where it is.
         if let Ok((x, y)) = self.screen.cursor() {
             self.router.set_local_cursor(x - self.local_origin.0, y - self.local_origin.1);

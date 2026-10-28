@@ -7,7 +7,7 @@
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -71,6 +71,8 @@ fn raw_is_recent() -> bool {
 /// so the hook's position minus this is how far the mouse moved, with no screen edge in the way.
 static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
 static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
+/// Whether captured movement is being counted against the anchor (as opposed to only blocked).
+static ANCHORED: AtomicBool = AtomicBool::new(false);
 static LAST_HOOK_X: AtomicI32 = AtomicI32::new(i32::MIN);
 static LAST_HOOK_Y: AtomicI32 = AtomicI32::new(i32::MIN);
 
@@ -151,6 +153,15 @@ impl InputSource for WinSource {
         )
     }
 
+    fn set_blocking(&mut self, block: bool) -> Result<()> {
+        ANCHORED.store(false, Ordering::Relaxed);
+        if !block {
+            LAST_HOOK_X.store(i32::MIN, Ordering::Relaxed);
+        }
+        with_shared(|shared| shared.capture = block)
+            .ok_or_else(|| PlatformError::Other("input capture stopped".into()))
+    }
+
     fn set_capture(&mut self, capture: bool) -> Result<()> {
         if capture {
             // SAFETY: plain calls with no pointers.
@@ -160,8 +171,10 @@ impl InputSource for WinSource {
                 ANCHOR_Y.store(y, Ordering::Relaxed);
                 SetCursorPos(x, y);
             }
+            ANCHORED.store(true, Ordering::Relaxed);
             hide_cursor();
         } else {
+            ANCHORED.store(false, Ordering::Relaxed);
             show_cursor();
             // The positions seen before and after capturing are not a movement.
             LAST_HOOK_X.store(i32::MIN, Ordering::Relaxed);
@@ -432,6 +445,9 @@ fn mouse_event(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
         WM_MOUSEMOVE => {
             let (x, y) = (info.pt.x, info.pt.y);
             if with_shared(|shared| shared.capture).unwrap_or(false) {
+                if !ANCHORED.load(Ordering::Relaxed) {
+                    return true;
+                }
                 let (dx, dy) = (x - ANCHOR_X.load(Ordering::Relaxed), y - ANCHOR_Y.load(Ordering::Relaxed));
                 if dx == 0 && dy == 0 {
                     return true;

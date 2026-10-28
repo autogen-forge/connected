@@ -188,6 +188,21 @@ impl InputSource for MacSource {
         }
         Ok(())
     }
+
+    fn set_blocking(&mut self, block: bool) -> Result<()> {
+        self.block(block);
+        Ok(())
+    }
+}
+
+impl MacSource {
+    /// Swallows this computer's own input without hiding the cursor.
+    fn block(&mut self, block: bool) {
+        self.capture.store(block, Ordering::Release);
+        if !block {
+            self.cursor.show();
+        }
+    }
 }
 
 impl Drop for MacSource {
