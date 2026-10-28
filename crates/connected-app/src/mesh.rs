@@ -731,6 +731,11 @@ fn event_loop(
     let mut heard_input = false;
     let mut warned_deaf = false;
     let started = Instant::now();
+    (world.log)(&format!(
+        "mesh started, build {} {}",
+        option_env!("GITHUB_REF_NAME").unwrap_or("local"),
+        option_env!("GITHUB_SHA").map_or("", |sha| sha.get(..7).unwrap_or(sha)),
+    ));
 
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Relaxed) {
