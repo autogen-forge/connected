@@ -36,15 +36,14 @@ pub fn open_screen() -> Result<Box<dyn ScreenInfo>> {
     Ok(Box::new(sink::MacScreen::open()?))
 }
 
+/// The permissions this program needs. Only Accessibility: the event tap is an active one, which
+/// may swallow events, and the system asks Accessibility of such a tap and of sending events.
+/// Input Monitoring is for taps that only listen, so it is neither needed nor asked for; and the
+/// Post Events preflight just follows Accessibility, so it adds nothing to wait for. (The
+/// system's own log, `subsystem == "com.apple.TCC"`, shows grants as Accessibility only.)
 pub fn permissions() -> Vec<Permission> {
-    // SAFETY: these are argument-free preflight queries.
-    unsafe {
-        vec![
-            Permission { name: "Accessibility", granted: AXIsProcessTrusted() },
-            Permission { name: "Input Monitoring", granted: CGPreflightListenEventAccess() },
-            Permission { name: "Post Events", granted: CGPreflightPostEventAccess() },
-        ]
-    }
+    // SAFETY: an argument-free preflight query.
+    unsafe { vec![Permission { name: "Accessibility", granted: AXIsProcessTrusted() }] }
 }
 
 /// Asks the system to show its permission prompts for whatever is still missing.
@@ -57,8 +56,6 @@ pub fn request_permissions() {
     // SAFETY: `options` is a valid dictionary for the duration of the call.
     unsafe {
         AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef());
-        CGRequestListenEventAccess();
-        CGRequestPostEventAccess();
     }
 }
 
@@ -68,10 +65,3 @@ unsafe extern "C" {
     fn AXIsProcessTrustedWithOptions(options: core_foundation::dictionary::CFDictionaryRef) -> bool;
 }
 
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGPreflightListenEventAccess() -> bool;
-    fn CGPreflightPostEventAccess() -> bool;
-    fn CGRequestListenEventAccess() -> bool;
-    fn CGRequestPostEventAccess() -> bool;
-}

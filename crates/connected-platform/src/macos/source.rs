@@ -143,7 +143,7 @@ fn spawn_tap(
         Err(()) => {
             let _ = ready.send(Err(PlatformError::PermissionDenied(
                 "cannot create the event tap; allow this app under System Settings > \
-                 Privacy & Security > Accessibility and Input Monitoring",
+                 Privacy & Security > Accessibility",
             )));
             return;
         }
