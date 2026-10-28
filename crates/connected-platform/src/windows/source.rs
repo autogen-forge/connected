@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use connected_core::platform::{PlatformError, Result};
 use connected_core::{InputEvent, InputSource};
 use connected_proto::{ButtonState, MouseButton};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::{
@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::Input::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    CreateCursor, GetSystemMetrics, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
+    CreateCursor, GetCursorPos, GetSystemMetrics, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
     MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS, SetCursorPos, SetSystemCursor, SetTimer, SetWindowsHookExW, SystemParametersInfoW, TranslateMessage,
     UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
@@ -67,10 +67,6 @@ fn raw_is_recent() -> bool {
     let last = LAST_RAW_MS.load(Ordering::Relaxed);
     last != 0 && now_ms().saturating_sub(last) < RAW_RECENT_MS
 }
-/// Where the cursor is held while capturing. Swallowed movement leaves the cursor where it is,
-/// so the hook's position minus this is how far the mouse moved, with no screen edge in the way.
-static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
-static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
 /// Whether captured movement is being counted against the anchor (as opposed to only blocked).
 static ANCHORED: AtomicBool = AtomicBool::new(false);
 static LAST_HOOK_X: AtomicI32 = AtomicI32::new(i32::MIN);
@@ -167,8 +163,6 @@ impl InputSource for WinSource {
             // SAFETY: plain calls with no pointers.
             unsafe {
                 let (x, y) = (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2);
-                ANCHOR_X.store(x, Ordering::Relaxed);
-                ANCHOR_Y.store(y, Ordering::Relaxed);
                 SetCursorPos(x, y);
             }
             ANCHORED.store(true, Ordering::Relaxed);
@@ -467,7 +461,13 @@ fn mouse_event(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
                 if !ANCHORED.load(Ordering::Relaxed) {
                     return true;
                 }
-                let (dx, dy) = (x - ANCHOR_X.load(Ordering::Relaxed), y - ANCHOR_Y.load(Ordering::Relaxed));
+                // Swallowed movement leaves the cursor where it is, so the hook's position minus
+                // the cursor's is how far the mouse moved. (Measuring from the anchor instead
+                // would count any early drift away from it again with every movement.)
+                let mut at = POINT { x, y };
+                // SAFETY: `at` is valid for writes.
+                unsafe { GetCursorPos(&mut at) };
+                let (dx, dy) = (x - at.x, y - at.y);
                 if dx == 0 && dy == 0 {
                     return true;
                 }
