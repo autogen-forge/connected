@@ -62,6 +62,10 @@ pub struct MacSink {
     last_click: Option<Click>,
     /// Scroll remainder (x, y) in wire units that has not yet added up to a whole line.
     scroll_remainder: (i32, i32),
+    /// Where this sink last put the cursor. The system takes a moment to act on a posted move,
+    /// and reading the cursor back before then gives the old place; a movement worked out from
+    /// that would undo the one before it.
+    at: Option<CGPoint>,
 }
 
 // SAFETY: the event source is only used from whichever thread owns the sink, and CoreGraphics
@@ -78,7 +82,33 @@ impl MacSink {
             held_buttons: Vec::new(),
             last_click: None,
             scroll_remainder: (0, 0),
+            at: None,
         })
+    }
+
+    /// Where the cursor is: where this sink put it, or else where the system says.
+    fn position(&self) -> Result<CGPoint> {
+        match self.at {
+            Some(at) => Ok(at),
+            None => self.cursor(),
+        }
+    }
+
+    /// `point`, or the nearest point on a display if it is off all of them. The system keeps the
+    /// cursor on a display; a position worked out here must not run off into the dark.
+    fn keep_on_screen(&self, point: CGPoint) -> CGPoint {
+        let Ok(displays) = ordered_displays() else {
+            return point;
+        };
+        let nearest = displays
+            .iter()
+            .map(|(rect, _)| {
+                let x = point.x.clamp(f64::from(rect.x), f64::from(rect.x + rect.width - 1));
+                let y = point.y.clamp(f64::from(rect.y), f64::from(rect.y + rect.height - 1));
+                (CGPoint::new(x, y), (x - point.x).powi(2) + (y - point.y).powi(2))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        nearest.map_or(point, |(point, _)| point)
     }
 
     fn post(&self, event: &CGEvent) {
@@ -151,17 +181,21 @@ impl MacSink {
 
 impl InputSink for MacSink {
     fn move_abs(&mut self, x: i32, y: i32) -> Result<()> {
-        let from = self.cursor()?;
-        self.post_motion(from, CGPoint::new(f64::from(x), f64::from(y)))
+        let to = self.keep_on_screen(CGPoint::new(f64::from(x), f64::from(y)));
+        let from = self.position()?;
+        self.at = Some(to);
+        self.post_motion(from, to)
     }
 
     fn move_rel(&mut self, dx: i32, dy: i32) -> Result<()> {
-        let from = self.cursor()?;
-        self.post_motion(from, CGPoint::new(from.x + f64::from(dx), from.y + f64::from(dy)))
+        let from = self.position()?;
+        let to = self.keep_on_screen(CGPoint::new(from.x + f64::from(dx), from.y + f64::from(dy)));
+        self.at = Some(to);
+        self.post_motion(from, to)
     }
 
     fn button(&mut self, button: MouseButton, state: ButtonState) -> Result<()> {
-        let pos = self.cursor()?;
+        let pos = self.position()?;
         let spec = spec(button);
         let kind = match state {
             ButtonState::Down => spec.down,
@@ -254,6 +288,8 @@ impl InputSink for MacSink {
             }
         }
         self.scroll_remainder = (0, 0);
+        // Control is over: the person may move the cursor themselves now.
+        self.at = None;
         first_error.map_or(Ok(()), Err)
     }
 }
