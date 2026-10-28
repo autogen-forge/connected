@@ -13,6 +13,8 @@ use connected_core::{Arrangement, Metrics, default_displays};
 use connected_net::{Identity, Node, PairingPrompt, TrustStore};
 use connected_proto::Edge;
 
+mod probe;
+
 const DEFAULT_ADDR: &str = "0.0.0.0:24900";
 const TRUST_FILE: &str = "trusted_peers";
 
@@ -76,6 +78,10 @@ enum Command {
         peers: Vec<(String, String)>,
     },
 
+    /// Walk through what this computer's input backend can do (reading the mouse, pushing against
+    /// an edge, capturing, moving the cursor) and save the result in `connected-test.txt`.
+    Test,
+
     /// Report which platform backends work on this machine.
     Check {
         /// Ask the OS to show its permission prompts for anything missing.
@@ -97,6 +103,7 @@ fn main() -> Result<()> {
         Command::Trusted => list_trusted(&home),
         Command::Forget { who } => forget(&home, &who),
         Command::Run { listen, places, peers } => run(&home, cli.name, &listen, places, peers),
+        Command::Test => probe::run(),
         Command::Check { request_permissions } => check(request_permissions),
     }
 }

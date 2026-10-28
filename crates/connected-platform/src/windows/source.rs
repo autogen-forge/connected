@@ -25,8 +25,8 @@ use windows_sys::Win32::UI::Input::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
-    MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage,
+    CreateCursor, GetSystemMetrics, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
+    MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS, SetCursorPos, SetSystemCursor, SetWindowsHookExW, SystemParametersInfoW, TranslateMessage,
     UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -67,6 +67,10 @@ fn raw_is_recent() -> bool {
     let last = LAST_RAW_MS.load(Ordering::Relaxed);
     last != 0 && now_ms().saturating_sub(last) < RAW_RECENT_MS
 }
+/// Where the cursor is held while capturing. Swallowed movement leaves the cursor where it is,
+/// so the hook's position minus this is how far the mouse moved, with no screen edge in the way.
+static ANCHOR_X: AtomicI32 = AtomicI32::new(0);
+static ANCHOR_Y: AtomicI32 = AtomicI32::new(0);
 static LAST_HOOK_X: AtomicI32 = AtomicI32::new(i32::MIN);
 static LAST_HOOK_Y: AtomicI32 = AtomicI32::new(i32::MIN);
 
@@ -92,6 +96,8 @@ pub struct WinSource {
 
 impl WinSource {
     pub fn open() -> Result<Self> {
+        // A cursor left hidden by a run that was cut short is put back.
+        show_cursor();
         let (events, receiver) = mpsc::channel();
         {
             let mut shared = SHARED.lock().map_err(|_| PlatformError::Other("capture state is poisoned".into()))?;
@@ -146,6 +152,20 @@ impl InputSource for WinSource {
     }
 
     fn set_capture(&mut self, capture: bool) -> Result<()> {
+        if capture {
+            // SAFETY: plain calls with no pointers.
+            unsafe {
+                let (x, y) = (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2);
+                ANCHOR_X.store(x, Ordering::Relaxed);
+                ANCHOR_Y.store(y, Ordering::Relaxed);
+                SetCursorPos(x, y);
+            }
+            hide_cursor();
+        } else {
+            show_cursor();
+            // The positions seen before and after capturing are not a movement.
+            LAST_HOOK_X.store(i32::MIN, Ordering::Relaxed);
+        }
         with_shared(|shared| shared.capture = capture)
             .ok_or_else(|| PlatformError::Other("input capture stopped".into()))
     }
@@ -155,6 +175,7 @@ impl Drop for WinSource {
     fn drop(&mut self) {
         // Let go of everything first, then end the message loop of the hook thread.
         let _ = with_shared(|shared| shared.capture = false);
+        show_cursor();
         // SAFETY: a plain call; if the thread is already gone it simply fails.
         unsafe {
             PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0);
@@ -163,6 +184,40 @@ impl Drop for WinSource {
             let _ = thread.join();
         }
         clear_shared();
+    }
+}
+
+// ---- hiding the cursor ----
+
+/// The standard cursors (`OCR_*`): the arrow, text, busy, and so on.
+const SYSTEM_CURSORS: [u32; 13] = [
+    32512, 32513, 32514, 32515, 32516, 32642, 32643, 32644, 32645, 32646, 32648, 32649, 32650,
+];
+
+/// Replaces every standard cursor with an invisible one. Windows has no call to hide the cursor
+/// for the whole desktop, only for the windows of the calling thread.
+fn hide_cursor() {
+    let module = unsafe { GetModuleHandleW(null()) };
+    // All bits set in the AND plane and none in the XOR plane leave the screen as it is.
+    let and_plane = [0xFFu8; 128];
+    let xor_plane = [0u8; 128];
+    for id in SYSTEM_CURSORS {
+        // SAFETY: the planes are 32x32 bits, as the size passed says. Windows takes the handle
+        // over, so a new one is made for each cursor.
+        unsafe {
+            let blank = CreateCursor(module, 0, 0, 32, 32, and_plane.as_ptr().cast(), xor_plane.as_ptr().cast());
+            if !blank.is_null() {
+                SetSystemCursor(blank, id);
+            }
+        }
+    }
+}
+
+/// Puts the user's cursors back, from the settings they chose.
+fn show_cursor() {
+    // SAFETY: a plain call; the pointer argument is unused for this action.
+    unsafe {
+        SystemParametersInfoW(SPI_SETCURSORS, 0, null_mut(), 0);
     }
 }
 
@@ -305,6 +360,10 @@ unsafe fn read_raw_input(handle: HRAWINPUT) {
         if read == u32::MAX || raw.header.dwType != RIM_TYPEMOUSE {
             return;
         }
+        // While capturing, movement is read from the hook against the anchor instead.
+        if with_shared(|shared| shared.capture).unwrap_or(false) {
+            return;
+        }
         let mouse = raw.data.mouse;
         // Devices that report where they are, not how far they moved, are left to the hooks.
         if mouse.usFlags & MOUSE_MOVE_ABSOLUTE != 0 {
@@ -372,6 +431,14 @@ fn mouse_event(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
     match message {
         WM_MOUSEMOVE => {
             let (x, y) = (info.pt.x, info.pt.y);
+            if with_shared(|shared| shared.capture).unwrap_or(false) {
+                let (dx, dy) = (x - ANCHOR_X.load(Ordering::Relaxed), y - ANCHOR_Y.load(Ordering::Relaxed));
+                if dx == 0 && dy == 0 {
+                    return true;
+                }
+                HOOK_MOVES.fetch_add(1, Ordering::Relaxed);
+                return report(InputEvent::MouseMove { dx, dy });
+            }
             let (last_x, last_y) = (LAST_HOOK_X.swap(x, Ordering::Relaxed), LAST_HOOK_Y.swap(y, Ordering::Relaxed));
             if !raw_is_recent() && last_x != i32::MIN && (x != last_x || y != last_y) {
                 HOOK_MOVES.fetch_add(1, Ordering::Relaxed);
