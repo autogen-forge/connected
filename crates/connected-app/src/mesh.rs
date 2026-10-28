@@ -27,7 +27,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -43,15 +43,17 @@ use connected_proto::{ButtonState, LayoutScreen, Message, Modifiers, Os};
 use crate::error::{AppError, Result};
 use crate::{HEARTBEAT_TIMEOUT, Log};
 
-const INPUT_POLL: Duration = Duration::from_millis(10);
+/// How long the event loop waits for local input before looking at what the links and the
+/// person's commands have to say. It is also how late a controlling computer's input can arrive.
+const INPUT_POLL: Duration = Duration::from_millis(2);
 const ACCEPT_POLL: Duration = Duration::from_millis(200);
 /// How often the dial thread looks for a computer it should be connected to and is not.
 const DIAL_EVERY: Duration = Duration::from_secs(2);
 /// How long a new link has to announce its screen.
 const SCREEN_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long a link thread waits for something to send before it looks at the socket.
-const OUTGOING_WAIT: Duration = Duration::from_millis(5);
-const INBOUND_EVERY: Duration = Duration::from_millis(20);
+/// How long a link thread waits at the socket for the other computer before it looks at what
+/// is queued to send. It is also how late anything queued to send can go out.
+const INBOUND_WAIT: Duration = Duration::from_millis(2);
 const PING_EVERY: Duration = Duration::from_secs(2);
 /// Larger than any real display; keeps absurd announcements out of the layout maths.
 const MAX_SCREEN_SIDE: i32 = 100_000;
@@ -419,7 +421,12 @@ impl World<'_> {
                         (self.log)(&format!("cannot move the cursor: {err}"));
                     }
                 }
-                Action::Send { to, msg } => self.send_to(&to, msg),
+                Action::Send { to, msg } => {
+                    if matches!(msg, Message::Enter { .. }) {
+                        (self.log)(&format!("cursor moved onto '{to}'"));
+                    }
+                    self.send_to(&to, msg);
+                }
             }
         }
     }
@@ -586,6 +593,7 @@ impl World<'_> {
             self.send_to(from, Message::Leave);
             return;
         }
+        (self.log)(&format!("'{from}' took control of this computer"));
         self.controlled_by = Some(from.to_owned());
         self.capture(true);
         let message = Message::Enter { x, y, seq: 0, modifiers };
@@ -606,9 +614,10 @@ impl World<'_> {
 
     /// This computer is its own again: its keys are let go and its own keyboard and mouse work.
     fn end_control(&mut self) {
-        if self.controlled_by.take().is_none() {
+        let Some(controller) = self.controlled_by.take() else {
             return;
-        }
+        };
+        (self.log)(&format!("'{controller}' let go of this computer"));
         if let Err(err) = self.sink.release_all() {
             (self.log)(&format!("cannot release held keys: {err}"));
         }
@@ -717,6 +726,7 @@ fn event_loop(
     stop: &AtomicBool,
 ) -> Result<()> {
     let mut held: HashSet<u16> = HashSet::new();
+    let mut heard_input = false;
 
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Relaxed) {
@@ -730,6 +740,10 @@ fn event_loop(
             let Some(input) = world.source.next_event_timeout(INPUT_POLL)? else {
                 continue;
             };
+            if !heard_input {
+                heard_input = true;
+                (world.log)("this computer's input is being read");
+            }
 
             if let InputEvent::Key { usage, state } = input {
                 match state {
@@ -991,38 +1005,38 @@ fn pump(
     device: &str,
     id: u64,
 ) -> std::result::Result<(), NetError> {
-    let started = Instant::now();
-    let (mut last_heard, mut last_ping, mut last_poll) = (started, started, started);
+    let mut last_heard = Instant::now();
+    let mut last_ping = last_heard;
     let mut pings = 0u64;
 
     while !stop.load(Ordering::Relaxed) {
-        match queue.recv_timeout(OUTGOING_WAIT) {
-            Ok(first) => {
-                for message in coalesce(first, queue) {
-                    session.send(&message)?;
+        loop {
+            match queue.try_recv() {
+                Ok(first) => {
+                    for message in coalesce(first, queue) {
+                        session.send(&message)?;
+                    }
                 }
+                Err(mpsc::TryRecvError::Empty) => break,
+                // The event loop dropped its end: the mesh is stopping, or this link was
+                // replaced by a newer one to the same device.
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            // The event loop dropped its end: the mesh is stopping, or this link was replaced by
-            // a newer one to the same device.
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
 
-        if last_poll.elapsed() >= INBOUND_EVERY {
-            while let Some(message) = session.recv_timeout(Duration::from_millis(1))? {
-                last_heard = Instant::now();
-                match message {
-                    Message::Ping(n) => session.send(&Message::Pong(n))?,
-                    Message::Pong(_) => {}
-                    other => {
-                        let event = LinkEvent::Message { device: device.to_owned(), id, message: other };
-                        if events.send(event).is_err() {
-                            return Ok(());
-                        }
+        // Waits here for the other computer; a message that comes is dealt with at once.
+        if let Some(message) = session.recv_timeout(INBOUND_WAIT)? {
+            last_heard = Instant::now();
+            match message {
+                Message::Ping(n) => session.send(&Message::Pong(n))?,
+                Message::Pong(_) => {}
+                other => {
+                    let event = LinkEvent::Message { device: device.to_owned(), id, message: other };
+                    if events.send(event).is_err() {
+                        return Ok(());
                     }
                 }
             }
-            last_poll = Instant::now();
         }
 
         if last_ping.elapsed() >= PING_EVERY {

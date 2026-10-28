@@ -9,6 +9,22 @@ use connected_core::{InputSink, InputSource, ScreenInfo};
 
 pub const NAME: &str = "windows (low-level hooks / SendInput)";
 
+/// Asks Windows to keep its clock ticking every millisecond instead of every 15. Waits on the
+/// network and between messages are rounded up to a tick, which would make the cursor of another
+/// computer move in jumps.
+fn fine_timer() {
+    use std::sync::Once;
+    use windows_sys::Win32::Media::timeBeginPeriod;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: a plain call; it lasts until the program ends.
+        unsafe {
+            timeBeginPeriod(1);
+        }
+    });
+}
+
 /// Makes this process see the real pixels of every monitor. Without it, Windows shows a
 /// program that does not say it can cope with scaling a pretend, scaled-down desktop, and the
 /// cursor positions and monitor sizes it reads would not match what the other computers expect.
@@ -19,6 +35,7 @@ fn see_real_pixels() {
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
 
+    fine_timer();
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         // SAFETY: a plain call with a constant; it fails harmlessly when already set.
