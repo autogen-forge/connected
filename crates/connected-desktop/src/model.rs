@@ -8,40 +8,34 @@ use std::collections::{BTreeMap, VecDeque};
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use connected_app::{
-    AppError, ClientHandle, ClientStatus, Log, Mode, PairingEvent, PairingSession,
-    ServerBackends, ServerHandle, ServerState, Settings,
+    AppError, Log, MeshBackends, MeshHandle, MeshStart, MeshState, PairingEvent, PairingSession,
+    Settings, now_ms,
 };
-use connected_core::{
-    Desktop, InputSink, Metrics, Os, PlaceError, Rect, ScreenInfo, default_displays, normalize,
-};
+use connected_core::{Desktop, Metrics, Os, PlaceError, Rect, default_displays, normalize};
 use connected_net::{Fingerprint, Identity, Node, TrustStore, TrustedPeer};
 
-/// The port a sharing computer listens on unless told otherwise.
-pub const SERVER_PORT: u16 = 24900;
-/// The port a computer waits on while pairing. Separate from the server's port, so pairing
-/// can be done while sharing is running.
+/// The port a computer listens on unless told otherwise.
+pub const MESH_PORT: u16 = 24900;
+/// The port a computer waits on while pairing. Separate from the mesh's port, so pairing
+/// can be done while the computers are connected.
 pub const PAIRING_PORT: u16 = 24901;
 
 const TRUST_FILE: &str = "trusted_peers";
 const LOG_LINES: usize = 1000;
-const RECONNECT_AFTER: Duration = Duration::from_secs(3);
 
-type ServerFactory = Arc<dyn Fn() -> Result<ServerBackends, AppError> + Send + Sync>;
+type MeshFactory = Arc<dyn Fn() -> Result<MeshBackends, AppError> + Send + Sync>;
 /// A computer's displays and how much each is magnified, in percent.
 pub type LocalScreen = (Vec<Rect>, Vec<u16>);
 type ScreenSizeFactory = Arc<dyn Fn() -> Option<LocalScreen> + Send + Sync>;
-type ClientFactory =
-    Arc<dyn Fn() -> Result<(Box<dyn InputSink>, Box<dyn ScreenInfo>), AppError> + Send + Sync>;
 
 /// Where input comes from and goes to. The real thing talks to the operating system; tests
 /// and the demo use in-memory stand-ins.
 #[derive(Clone)]
 pub struct Backends {
-    pub server: ServerFactory,
-    pub client: ClientFactory,
+    pub mesh: MeshFactory,
     /// This computer's displays, if they can be found out.
     pub local_screen: ScreenSizeFactory,
 }
@@ -49,15 +43,12 @@ pub struct Backends {
 impl Backends {
     pub fn system() -> Self {
         Self {
-            server: Arc::new(|| {
-                Ok(ServerBackends {
+            mesh: Arc::new(|| {
+                Ok(MeshBackends {
                     source: connected_platform::open_source()?,
-                    cursor_sink: connected_platform::open_sink()?,
+                    sink: connected_platform::open_sink()?,
                     screen: connected_platform::open_screen()?,
                 })
-            }),
-            client: Arc::new(|| {
-                Ok((connected_platform::open_sink()?, connected_platform::open_screen()?))
             }),
             local_screen: Arc::new(|| {
                 let screen = connected_platform::open_screen().ok()?;
@@ -130,11 +121,13 @@ impl PairingFlow {
         Self { session: None, stage: PairingStage::Choosing }
     }
 
-    fn poll(&mut self) {
+    /// Moves along; returns the computer that was paired, if a pairing just finished.
+    fn poll(&mut self) -> Option<connected_net::Peer> {
         let events: Vec<PairingEvent> = match &self.session {
             Some(session) => std::iter::from_fn(|| session.poll()).collect(),
-            None => return,
+            None => return None,
         };
+        let mut paired = None;
         for event in events {
             self.stage = match event {
                 PairingEvent::Waiting { addr } => PairingStage::Waiting { addr },
@@ -145,10 +138,14 @@ impl PairingFlow {
                 },
                 PairingEvent::Finished(outcome) => {
                     self.session = None;
+                    if let Ok(peer) = &outcome {
+                        paired = Some(peer.clone());
+                    }
                     PairingStage::Done(outcome.map(|peer| peer.name))
                 }
             };
         }
+        paired
     }
 }
 
@@ -160,7 +157,7 @@ pub struct Device {
     pub online: bool,
     /// Its displays, while it is connected.
     pub displays: Option<Vec<Rect>>,
-    /// Where its connection comes from, while it is connected.
+    /// Where this computer reaches it, as `address:port`, if it is known.
     pub address: Option<String>,
 }
 
@@ -169,8 +166,7 @@ pub struct AppModel {
     node: Node,
     backends: Backends,
     pub settings: Settings,
-    server: Option<ServerHandle>,
-    client: Option<ClientHandle>,
+    mesh: Option<MeshHandle>,
     pub pairing: Option<PairingFlow>,
     logs: LogBuffer,
     local_displays: Vec<Rect>,
@@ -216,8 +212,7 @@ impl AppModel {
             node,
             backends,
             settings,
-            server: None,
-            client: None,
+            mesh: None,
             pairing: None,
             logs: LogBuffer::new(),
             notice: None,
@@ -269,95 +264,60 @@ impl AppModel {
     // ---- running ----
 
     pub fn is_running(&self) -> bool {
-        self.server.is_some() || self.client.is_some()
+        self.mesh.is_some()
     }
 
-    pub fn server_state(&self) -> Option<ServerState> {
-        self.server.as_ref().map(ServerHandle::state)
+    pub fn mesh_state(&self) -> Option<MeshState> {
+        self.mesh.as_ref().map(MeshHandle::state)
     }
 
-    /// How the sharing computer says the computers are laid out, while this one receives.
-    pub fn client_layout(&self) -> Option<Vec<connected_proto::LayoutScreen>> {
-        self.client.as_ref().and_then(ClientHandle::layout)
-    }
-
-    pub fn client_status(&self) -> Option<ClientStatus> {
-        self.client.as_ref().map(ClientHandle::status)
-    }
-
-    /// Starts sharing or receiving, whichever the mode says.
+    /// Starts listening for the paired computers and connecting to them.
     pub fn start(&mut self) {
         if self.is_running() {
             return;
         }
         self.notice = None;
-        match self.settings.mode {
-            Mode::Share => self.start_sharing(),
-            Mode::Receive => self.start_receiving(),
-        }
-    }
-
-    fn start_sharing(&mut self) {
-        let factory = Arc::clone(&self.backends.server);
-        let started = ServerHandle::start(
+        let factory = Arc::clone(&self.backends.mesh);
+        let start = MeshStart {
+            arrangement: self.settings.arrangement.clone(),
+            layout_version: self.settings.layout_version,
+            peer_addresses: self.settings.peer_addresses.clone(),
+        };
+        let started = MeshHandle::start(
             self.node.clone(),
             &self.settings.listen,
-            self.settings.arrangement.clone(),
+            start,
             move || factory(),
             self.logs.writer(),
         );
         match started {
-            Ok(server) => {
-                self.log_line(&format!("sharing started, listening on {}", server.state().listening_on));
-                self.server = Some(server);
+            Ok(mesh) => {
+                self.log_line(&format!("started, listening on {}", mesh.state().listening_on));
+                self.mesh = Some(mesh);
             }
-            Err(err) => self.notice = Some(format!("공유를 시작하지 못했습니다: {err}")),
+            Err(err) => self.notice = Some(format!("연결을 시작하지 못했습니다: {err}")),
         }
-    }
-
-    fn start_receiving(&mut self) {
-        let address = self.settings.server_address.trim();
-        if address.is_empty() {
-            self.notice = Some("연결할 컴퓨터의 주소를 먼저 입력하세요.".into());
-            return;
-        }
-        let address = with_default_port(address, SERVER_PORT);
-        let factory = Arc::clone(&self.backends.client);
-        self.log_line(&format!("connecting to {address}"));
-        self.client = Some(ClientHandle::start(
-            self.node.clone(),
-            address,
-            move || factory(),
-            RECONNECT_AFTER,
-            self.logs.writer(),
-        ));
     }
 
     pub fn stop(&mut self) {
-        if let Some(mut server) = self.server.take() {
-            server.stop();
-            self.log_line("sharing stopped");
-        }
-        if let Some(mut client) = self.client.take() {
-            client.stop();
-            self.log_line("receiving stopped");
+        if let Some(mut mesh) = self.mesh.take() {
+            mesh.stop();
+            self.log_line("stopped");
         }
     }
 
-    pub fn set_mode(&mut self, mode: Mode) {
-        if self.settings.mode == mode {
-            return;
+    /// Sets where to reach a paired computer. An empty address forgets it.
+    pub fn set_peer_address(&mut self, device: &str, address: &str) {
+        let address = address.trim();
+        let address = (!address.is_empty()).then(|| with_default_port(address, MESH_PORT));
+        match &address {
+            Some(address) => self.settings.peer_addresses.insert(device.to_owned(), address.clone()),
+            None => self.settings.peer_addresses.remove(device),
+        };
+        if let Some(mesh) = &self.mesh {
+            mesh.set_peer_address(device, address);
         }
-        self.stop();
-        self.settings.mode = mode;
         self.save();
-    }
-
-    pub fn set_server_address(&mut self, address: String) {
-        if self.settings.server_address != address {
-            self.settings.server_address = address;
-            self.save();
-        }
     }
 
     // ---- layout ----
@@ -410,8 +370,8 @@ impl AppModel {
     /// connected, as it said last time otherwise.
     pub fn known_scales(&self) -> BTreeMap<String, Vec<u16>> {
         let mut known = self.settings.known_scales.clone();
-        for client in self.server_state().map(|state| state.clients).unwrap_or_default() {
-            known.insert(client.name, client.scales);
+        for peer in self.mesh_state().map(|state| state.peers).unwrap_or_default() {
+            known.insert(peer.name, peer.scales);
         }
         known
     }
@@ -420,8 +380,8 @@ impl AppModel {
     /// last time otherwise.
     pub fn known_systems(&self) -> BTreeMap<String, Os> {
         let mut known = self.settings.known_os.clone();
-        for client in self.server_state().map(|state| state.clients).unwrap_or_default() {
-            known.insert(client.name, client.os);
+        for peer in self.mesh_state().map(|state| state.peers).unwrap_or_default() {
+            known.insert(peer.name, peer.os);
         }
         known
     }
@@ -430,8 +390,8 @@ impl AppModel {
     /// had last time otherwise.
     pub fn known_displays(&self) -> BTreeMap<String, Vec<Rect>> {
         let mut known = self.settings.known_screens.clone();
-        for client in self.server_state().map(|state| state.clients).unwrap_or_default() {
-            known.insert(client.name, client.displays);
+        for peer in self.mesh_state().map(|state| state.peers).unwrap_or_default() {
+            known.insert(peer.name, peer.displays);
         }
         known
     }
@@ -442,28 +402,43 @@ impl AppModel {
         }
     }
 
+    /// The person changed the layout: it gets a newer version, goes to every connected computer,
+    /// and is kept.
     fn arrangement_changed(&mut self) {
-        if let Some(server) = &self.server {
-            server.set_arrangement(self.settings.arrangement.clone());
+        self.settings.layout_version = now_ms().max(self.settings.layout_version + 1);
+        if let Some(mesh) = &self.mesh {
+            mesh.set_arrangement(self.settings.arrangement.clone(), self.settings.layout_version);
         }
         self.save();
+    }
+
+    /// Takes in a layout that another computer sent, if it is newer than this one's.
+    fn adopt_shared_layout(&mut self) {
+        let Some(state) = self.mesh_state() else {
+            return;
+        };
+        if state.layout_version > self.settings.layout_version {
+            self.settings.arrangement = state.arrangement;
+            self.settings.layout_version = state.layout_version;
+            self.save();
+        }
     }
 
     // ---- paired computers ----
 
     /// Everyone this computer is paired with, with who is connected right now.
     pub fn devices(&self) -> Vec<Device> {
-        let connected = self.server_state().map(|state| state.clients).unwrap_or_default();
+        let connected = self.mesh_state().map(|state| state.peers).unwrap_or_default();
         let mut devices: Vec<Device> = self
             .node
             .trusted_peers()
             .into_iter()
             .map(|TrustedPeer { name, fingerprint }| {
-                let client = connected.iter().find(|client| client.name == name);
+                let peer = connected.iter().find(|peer| peer.name == name);
                 Device {
-                    online: client.is_some(),
-                    displays: client.map(|client| client.displays.clone()),
-                    address: client.map(|client| client.from.clone()),
+                    online: peer.is_some(),
+                    displays: peer.map(|peer| peer.displays.clone()),
+                    address: self.settings.peer_addresses.get(&name).cloned(),
                     name,
                     fingerprint,
                 }
@@ -485,9 +460,11 @@ impl AppModel {
                 return;
             }
         }
-        if let Some(server) = &self.server {
-            server.disconnect(name);
+        if let Some(mesh) = &self.mesh {
+            mesh.set_peer_address(name, None);
+            mesh.disconnect(name);
         }
+        self.settings.peer_addresses.remove(name);
         self.settings.known_screens.remove(name);
         self.settings.known_os.remove(name);
         self.settings.known_scales.remove(name);
@@ -554,27 +531,39 @@ impl AppModel {
 
     // ---- housekeeping ----
 
-    /// Call regularly: moves along a pairing, and notices when sharing or receiving ended
-    /// on its own.
+    /// Call regularly: moves along a pairing, takes in layouts other computers sent, and
+    /// notices when the mesh ended on its own.
     pub fn tick(&mut self) {
-        if let Some(flow) = &mut self.pairing {
-            flow.poll();
+        let paired = self.pairing.as_mut().and_then(PairingFlow::poll);
+        if let Some(peer) = paired {
+            self.learn_address(&peer);
         }
 
-        if let Some(server) = &self.server {
-            if !server.is_running() {
-                let error = server.state().error;
-                self.server = None;
+        if let Some(mesh) = &self.mesh {
+            if !mesh.is_running() {
+                let error = mesh.state().error;
+                self.mesh = None;
                 if let Some(error) = error {
-                    self.notice = Some(format!("공유가 멈췄습니다: {error}"));
+                    self.notice = Some(format!("연결이 멈췄습니다: {error}"));
                 }
             }
         }
-        if let Some(ClientStatus::Failed { reason }) = self.client_status() {
-            self.client = None;
-            self.notice = Some(format!("받기를 시작하지 못했습니다: {reason}"));
-        }
+        self.adopt_shared_layout();
         self.remember_screen_sizes();
+    }
+
+    /// A computer was just paired: remember where it is, so the two can find each other again.
+    fn learn_address(&mut self, peer: &connected_net::Peer) {
+        let Some(ip) = peer.address else {
+            return;
+        };
+        let address = std::net::SocketAddr::new(ip, MESH_PORT).to_string();
+        self.log_line(&format!("'{}' is at {address}", peer.name));
+        self.settings.peer_addresses.insert(peer.name.clone(), address.clone());
+        if let Some(mesh) = &self.mesh {
+            mesh.set_peer_address(&peer.name, Some(address));
+        }
+        self.save();
     }
 
     /// Keeps the displays and system of each connected computer for when it is switched off.
@@ -610,9 +599,9 @@ impl Drop for AppModel {
     }
 }
 
-/// Whether a notice says that sharing or receiving could not be started.
+/// Whether a notice says that connecting could not be started.
 fn is_start_failure(notice: &str) -> bool {
-    notice.starts_with("공유를 시작하지 못했습니다") || notice.starts_with("받기를 시작하지 못했습니다")
+    notice.starts_with("연결을 시작하지 못했습니다")
 }
 
 /// Why a screen cannot be put in a spot, in words for the person using the app.
@@ -646,14 +635,15 @@ pub(crate) mod testing;
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::testing::{mock_backends, model, pair, wait_until};
     use super::*;
     use connected_core::{DEFAULT_SIZE, Point, Spot};
 
     fn failing_backends() -> Backends {
         Backends {
-            server: Arc::new(|| Err(AppError::Config("input is not allowed".into()))),
-            client: Arc::new(|| Err(AppError::Config("input is not allowed".into()))),
+            mesh: Arc::new(|| Err(AppError::Config("input is not allowed".into()))),
             local_screen: Arc::new(|| None),
         }
     }
@@ -670,27 +660,27 @@ mod tests {
         assert!(!model.is_running());
         assert!(model.devices().is_empty());
         assert_eq!(model.this_computer(), "desk");
-        assert!(model.server_state().is_none());
+        assert!(model.mesh_state().is_none());
     }
 
     #[test]
-    fn sharing_starts_and_stops() {
+    fn connecting_starts_and_stops() {
         let mut model = model("desk");
         model.start();
         assert!(model.is_running());
-        let state = model.server_state().unwrap();
+        let state = model.mesh_state().unwrap();
         assert!(state.running);
         assert_eq!(state.this_computer, "desk");
         assert!(model.notice.is_none());
 
         model.stop();
         assert!(!model.is_running());
-        assert!(model.logs().iter().any(|line| line.contains("sharing started")));
-        assert!(model.logs().iter().any(|line| line.contains("sharing stopped")));
+        assert!(model.logs().iter().any(|line| line.contains("started")));
+        assert!(model.logs().iter().any(|line| line.contains("stopped")));
     }
 
     #[test]
-    fn a_failure_to_start_sharing_is_explained() {
+    fn a_failure_to_start_is_explained() {
         let mut model = AppModel::in_memory("desk", failing_backends()).unwrap();
         model.settings.listen = "127.0.0.1:0".into();
         model.start();
@@ -699,40 +689,9 @@ mod tests {
     }
 
     #[test]
-    fn receiving_needs_an_address() {
-        let mut model = model("laptop");
-        model.set_mode(Mode::Receive);
-        model.start();
-        assert!(!model.is_running());
-        assert!(model.notice.is_some());
-    }
-
-    #[test]
-    fn a_receiver_that_cannot_inject_input_reports_it_and_stops() {
-        let mut model = AppModel::in_memory("laptop", failing_backends()).unwrap();
-        model.set_mode(Mode::Receive);
-        model.set_server_address("127.0.0.1:1".into());
-        model.start();
-        wait_until("the failure to surface", || {
-            model.tick();
-            !model.is_running()
-        });
-        assert!(model.notice.as_deref().unwrap().contains("input is not allowed"));
-    }
-
-    #[test]
-    fn changing_the_mode_stops_what_was_running() {
-        let mut model = model("desk");
-        model.start();
-        model.set_mode(Mode::Receive);
-        assert!(!model.is_running());
-        assert_eq!(model.settings.mode, Mode::Receive);
-    }
-
-    #[test]
     fn granting_the_last_permission_takes_down_the_notice_that_starting_failed() {
         let mut model = model("desk");
-        model.notice = Some("공유를 시작하지 못했습니다: permission denied".into());
+        model.notice = Some("연결을 시작하지 못했습니다: permission denied".into());
         model.note_permissions(true);
         assert!(model.notice.is_some(), "still missing, so the notice stays");
         model.note_permissions(false);
@@ -751,7 +710,7 @@ mod tests {
     #[test]
     fn a_notice_is_not_taken_down_if_nothing_was_ever_missing() {
         let mut model = model("desk");
-        model.notice = Some("받기를 시작하지 못했습니다: refused".into());
+        model.notice = Some("연결을 시작하지 못했습니다: refused".into());
         model.note_permissions(false);
         assert!(model.notice.is_some());
     }
@@ -813,13 +772,12 @@ mod tests {
         {
             let mut model = AppModel::open(&home, mock_backends()).unwrap();
             model.place_device("laptop", 1920, 40);
-            model.set_mode(Mode::Receive);
-            model.set_server_address("10.0.0.5".into());
+            model.set_peer_address("laptop", "10.0.0.5");
         }
         let model = AppModel::open(&home, mock_backends()).unwrap();
         assert_eq!(model.settings.arrangement.spot_of("laptop"), Some(Spot::At { x: 1920, y: 40 }));
-        assert_eq!(model.settings.mode, Mode::Receive);
-        assert_eq!(model.settings.server_address, "10.0.0.5");
+        assert_eq!(model.settings.peer_addresses.get("laptop").map(String::as_str), Some("10.0.0.5:24900"));
+        assert!(model.settings.layout_version > 0, "a change gets a version");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -878,50 +836,51 @@ mod tests {
     }
 
     #[test]
-    fn a_connected_device_shows_as_online_with_its_screen_size() {
+    fn pairing_remembers_where_the_other_computer_is() {
+        let (mut desk, mut laptop) = (model("desk"), model("laptop"));
+        pair(&mut desk, &mut laptop);
+        // Both are on this machine, so each reaches the other at the loopback address.
+        assert_eq!(desk.devices()[0].address.as_deref(), Some("127.0.0.1:24900"));
+        assert_eq!(laptop.devices()[0].address.as_deref(), Some("127.0.0.1:24900"));
+    }
+
+    #[test]
+    fn a_connected_device_shows_as_online_and_shares_the_layout() {
         let (mut desk, mut laptop) = (model("desk"), model("laptop"));
         pair(&mut desk, &mut laptop);
         desk.place_device("laptop", 1920, 0);
         desk.start();
-        let addr = desk.server_state().unwrap().listening_on;
-
-        laptop.set_mode(Mode::Receive);
-        laptop.set_server_address(addr);
         laptop.start();
+        desk.set_peer_address("laptop", &laptop.mesh_state().unwrap().listening_on);
+        laptop.set_peer_address("desk", &desk.mesh_state().unwrap().listening_on);
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !desk.devices().iter().any(|device| device.online) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !(desk.devices().iter().any(|d| d.online) && laptop.devices().iter().any(|d| d.online)) {
             assert!(
                 Instant::now() < deadline,
-                "the laptop never showed as online\ndesk log: {:#?}\nlaptop log: {:#?}\nlaptop status: {:?}",
+                "they never showed as online\ndesk log: {:#?}\nlaptop log: {:#?}",
                 desk.logs(),
                 laptop.logs(),
-                laptop.client_status()
             );
             std::thread::sleep(Duration::from_millis(5));
         }
         let device = desk.devices().remove(0);
-        assert_eq!(device.displays, Some(vec![Rect::new(0, 0, 2560, 1440)]));
+        assert_eq!(device.displays, Some(vec![Rect::new(0, 0, 1920, 1080)]));
 
-        // The receiving computer is shown the layout the sharing one arranged, with itself marked.
-        wait_until("the laptop to receive the layout", || laptop.client_layout().is_some());
-        let layout = laptop.client_layout().unwrap();
-        let mine = layout.iter().find(|screen| screen.you).expect("the laptop is in the layout");
-        assert_eq!(mine.name, "laptop");
-        assert_eq!((mine.x, mine.y), (1920, 0));
-        assert!(layout.iter().any(|screen| screen.name == "desk" && !screen.you));
+        // The laptop has the layout the desk made, with itself beside the desk.
+        wait_until("the laptop to take the layout", || {
+            laptop.tick();
+            laptop.settings.arrangement.contains("desk")
+        });
+        assert_eq!((laptop.settings.arrangement.local.x, laptop.settings.arrangement.local.y), (1920, 0));
+        assert_eq!(laptop.settings.layout_version, desk.settings.layout_version);
         desk.tick();
-        assert_eq!(
-            desk.settings.known_screens.get("laptop"),
-            Some(&vec![Rect::new(0, 0, 2560, 1440)]),
-            "remembered for later"
-        );
-        assert!(matches!(laptop.client_status(), Some(ClientStatus::Connected { .. } | ClientStatus::Connecting)));
+        assert_eq!(desk.settings.known_screens.get("laptop"), Some(&vec![Rect::new(0, 0, 1920, 1080)]), "remembered for later");
 
         // Forgetting it cuts it off at once.
         desk.forget_device("laptop");
         wait_until("the laptop to be cut off", || {
-            desk.server_state().is_some_and(|state| state.clients.is_empty())
+            desk.mesh_state().is_some_and(|state| state.peers.is_empty())
         });
     }
 

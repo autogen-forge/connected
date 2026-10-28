@@ -7,23 +7,18 @@
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use connected_app::Mode;
-
 use crate::snapshot::snapshot;
 use crate::state::AppState;
 
 pub fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value, String> {
     match command {
         "snapshot" => {}
-        "set_mode" => {
-            let mode: Mode = arg(&args, "mode")?;
-            with_model(state, |model| model.set_mode(mode));
-        }
         "start" => with_model(state, |model| model.start()),
         "stop" => with_model(state, |model| model.stop()),
-        "set_server_address" => {
+        "set_peer_address" => {
+            let device: String = arg(&args, "device")?;
             let address: String = arg(&args, "address")?;
-            with_model(state, |model| model.set_server_address(address));
+            with_model(state, |model| model.set_peer_address(&device, &address));
         }
         "place_device" => {
             let device: String = arg(&args, "device")?;
@@ -145,7 +140,6 @@ mod tests {
     fn the_first_snapshot_describes_an_idle_computer() {
         let snapshot = call(&state(), "snapshot", json!({}));
         assert_eq!(snapshot["this_computer"], "desk");
-        assert_eq!(snapshot["mode"], "share");
         assert_eq!(snapshot["running"], false);
         assert_eq!(snapshot["devices"], json!([]));
         assert_eq!(
@@ -158,9 +152,9 @@ mod tests {
                 "online": true,
             }])
         );
-        assert_eq!(snapshot["server"], Value::Null);
+        assert_eq!(snapshot["mesh"], Value::Null);
         assert_eq!(snapshot["pairing"], Value::Null);
-        assert_eq!(snapshot["server_port"], 24900);
+        assert_eq!(snapshot["mesh_port"], 24900);
         assert_eq!(snapshot["pairing_port"], 24901);
         assert!(snapshot["fingerprint"].as_str().unwrap().len() == 64);
     }
@@ -170,31 +164,37 @@ mod tests {
         let state = state();
         let started = call(&state, "start", json!({}));
         assert_eq!(started["running"], true);
-        assert_eq!(started["server"]["active_screen"], "desk");
-        assert!(started["server"]["listening_on"].as_str().unwrap().contains(':'));
+        assert_eq!(started["mesh"]["active_screen"], "desk");
+        assert_eq!(started["mesh"]["controlled_by"], Value::Null);
+        assert!(started["mesh"]["listening_on"].as_str().unwrap().contains(':'));
 
         let stopped = call(&state, "stop", json!({}));
         assert_eq!(stopped["running"], false);
-        assert_eq!(stopped["server"], Value::Null);
+        assert_eq!(stopped["mesh"], Value::Null);
     }
 
     #[test]
-    fn the_mode_and_address_are_changed_and_reported() {
-        let state = state();
-        let snapshot = call(&state, "set_mode", json!({ "mode": "receive" }));
-        assert_eq!(snapshot["mode"], "receive");
+    fn a_devices_address_is_set_and_reported() {
+        let state = state_with_a_laptop();
+        let snapshot = call(&state, "set_peer_address", json!({ "device": "laptop", "address": "10.0.0.5" }));
+        assert_eq!(snapshot["devices"][0]["address"], "10.0.0.5:24900");
 
-        let snapshot = call(&state, "set_server_address", json!({ "address": "10.0.0.5" }));
-        assert_eq!(snapshot["server_address"], "10.0.0.5");
+        let snapshot = call(&state, "set_peer_address", json!({ "device": "laptop", "address": "" }));
+        assert_eq!(snapshot["devices"][0]["address"], Value::Null);
     }
 
     #[test]
-    fn starting_to_receive_without_an_address_leaves_a_notice_that_can_be_dismissed() {
-        let state = state();
-        call(&state, "set_mode", json!({ "mode": "receive" }));
+    fn a_failure_to_start_leaves_a_notice_that_can_be_dismissed() {
+        let backends = crate::model::Backends {
+            mesh: std::sync::Arc::new(|| Err(connected_app::AppError::Config("no permission".into()))),
+            local_screen: std::sync::Arc::new(|| None),
+        };
+        let mut model = crate::model::AppModel::in_memory("desk", backends).unwrap();
+        model.settings.listen = "127.0.0.1:0".into();
+        let state = AppState::new(model, None);
         let snapshot = call(&state, "start", json!({}));
         assert_eq!(snapshot["running"], false);
-        assert!(snapshot["notice"].is_string());
+        assert!(snapshot["notice"].as_str().unwrap().contains("no permission"));
 
         let snapshot = call(&state, "dismiss_notice", json!({}));
         assert_eq!(snapshot["notice"], Value::Null);
@@ -319,28 +319,28 @@ mod tests {
         call(&state, "start", json!({}));
         let snapshot = call(&state, "snapshot", json!({}));
         let logs = snapshot["logs"].as_array().unwrap();
-        assert!(logs.iter().any(|line| line.as_str().unwrap().contains("sharing started")));
+        assert!(logs.iter().any(|line| line.as_str().unwrap().contains("started")));
     }
 
     #[test]
     fn unknown_commands_and_bad_arguments_are_errors_not_panics() {
         let state = state();
         assert!(dispatch(&state, "launch_missiles", json!({})).unwrap_err().contains("unknown command"));
-        assert!(dispatch(&state, "set_mode", json!({})).unwrap_err().contains("missing argument"));
-        assert!(dispatch(&state, "set_mode", json!({ "mode": "sideways" })).unwrap_err().contains("bad argument"));
+        assert!(dispatch(&state, "set_peer_address", json!({})).unwrap_err().contains("missing argument"));
+        assert!(dispatch(&state, "set_peer_address", json!({ "device": 5, "address": "" })).unwrap_err().contains("bad argument"));
         assert!(dispatch(&state, "place_device", json!({ "device": "x", "x": "one", "y": 0 })).is_err());
         assert!(dispatch(&state, "answer_pairing", json!({ "matches": "yes" })).is_err());
     }
 
     #[test]
     fn a_connected_device_is_reported_online_with_its_screen() {
-        // A second computer, as the demo makes them, connected to this one's server.
+        // Other computers, as the demo makes them, connected to this one.
         let (state, _demo) = {
             let (model, demo) = crate::demo::build().unwrap();
             (AppState::new(model, Some(demo)), ())
         };
         wait_until("the stand-in computers to connect", || {
-            as_json(&state)["server"]["clients"].as_array().is_some_and(|clients| clients.len() == 2)
+            as_json(&state)["mesh"]["peers"].as_array().is_some_and(|peers| peers.len() == 2)
         });
         let snapshot = call(&state, "snapshot", json!({}));
         let online: Vec<_> = snapshot["devices"]

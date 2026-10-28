@@ -1,5 +1,5 @@
 //! The Connected desktop app: a window for pairing computers, arranging their screens and
-//! sharing a keyboard and mouse between them.
+//! sharing a keyboard and mouse between all of them.
 //!
 //! The window is a web page (see `ui/`). It asks this program for a [`snapshot::Snapshot`]
 //! several times a second and draws it, and sends back what the person does as commands.
@@ -117,6 +117,14 @@ pub fn run() {
     if let Some(port) = args.dev_server {
         devserver::serve(state, port);
         return;
+    }
+
+    // Computers are connected to each other from the moment the app opens; nothing is started by
+    // hand. The demo started its own already.
+    if !args.demo {
+        if let Ok(mut model) = state.model.lock() {
+            model.start();
+        }
     }
 
     // This program has windows of its own, which changes how the cursor can be hidden.

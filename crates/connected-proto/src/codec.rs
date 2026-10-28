@@ -102,16 +102,11 @@ mod tests {
             Message::Pong(1),
             Message::PairDecision { accepted: true },
             Message::Layout {
-                screens: vec![LayoutScreen {
-                    name: "desk".into(),
-                    x: -10,
-                    y: 20,
-                    displays: vec![Rect::new(0, 0, 1920, 1080)],
-                    scales: vec![200],
-                    os: Os::Mac,
-                    you: false,
-                    online: true,
-                }],
+                version: 1_700_000_000_000,
+                screens: vec![
+                    LayoutScreen { fingerprint: "ab".repeat(32), x: -10, y: 20 },
+                    LayoutScreen { fingerprint: "cd".repeat(32), x: 1920, y: 0 },
+                ],
             },
             Message::Screen {
                 displays: vec![Rect::new(0, 0, 2560, 1440), Rect::new(2560, 360, 1920, 1080)],

@@ -1,13 +1,12 @@
 //! A made-up setup for trying the app without a second computer.
 //!
-//! A few stand-in computers are paired with the app and connect to its server over real TLS
-//! on this machine. Input is simulated, so nothing here touches the real keyboard or mouse.
+//! A few stand-in computers are paired with the app and connect to it over real TLS on this
+//! machine. Input is simulated, so nothing here touches the real keyboard or mouse.
 
 use std::thread;
-use std::time::Duration;
 
-use connected_app::{AppError, ClientHandle, ServerBackends};
-use connected_core::{InputSink, Metrics, Os, Rect, ScreenInfo};
+use connected_app::{AppError, MeshBackends, MeshHandle, MeshStart};
+use connected_core::{Metrics, Os, Rect};
 use connected_net::{Identity, Node, TrustStore};
 use connected_platform::mock::{ChannelSource, FixedScreen, SharedRecordingSink};
 
@@ -15,7 +14,7 @@ use crate::model::{AppModel, Backends};
 
 /// Keeps the stand-in computers alive for as long as the demo runs.
 pub struct Demo {
-    _clients: Vec<ClientHandle>,
+    _computers: Vec<MeshHandle>,
 }
 
 /// A made-up computer.
@@ -49,21 +48,15 @@ const MACHINES: &[Machine] = &[
 
 pub fn build() -> Result<(AppModel, Demo), AppError> {
     let backends = Backends {
-        server: std::sync::Arc::new(|| {
+        mesh: std::sync::Arc::new(|| {
             let (source, _input, _capture) = ChannelSource::new();
-            Ok(ServerBackends {
+            Ok(MeshBackends {
                 source: Box::new(source),
-                cursor_sink: Box::new(SharedRecordingSink::default()),
+                sink: Box::new(SharedRecordingSink::default()),
                 screen: Box::new(FixedScreen::new(1512, 982)),
             })
         }),
         local_screen: std::sync::Arc::new(|| Some((vec![Rect::new(0, 0, 1512, 982)], vec![200]))),
-        client: std::sync::Arc::new(|| {
-            Ok((
-                Box::new(SharedRecordingSink::default()) as Box<dyn InputSink>,
-                Box::new(FixedScreen::new(1920, 1080)) as Box<dyn ScreenInfo>,
-            ))
-        }),
     };
 
     let mut model = AppModel::in_memory("Studio Mac", backends)?;
@@ -86,35 +79,44 @@ pub fn build() -> Result<(AppModel, Demo), AppError> {
     }
 
     model.start();
-    let address = model.server_state().map(|state| state.listening_on).unwrap_or_default();
+    let address = model.mesh_state().map(|state| state.listening_on).unwrap_or_default();
 
-    let mut clients = Vec::new();
+    let mut computers = Vec::new();
     for (node, displays, scales, os, connects) in machines {
         if !connects {
             continue;
         }
-        clients.push(ClientHandle::start(
+        let name = node.identity().name().to_owned();
+        let start = MeshStart {
+            peer_addresses: [("Studio Mac".to_owned(), address.clone())].into(),
+            ..MeshStart::default()
+        };
+        let mesh = MeshHandle::start(
             node,
-            address.clone(),
+            "127.0.0.1:0",
+            start,
             move || {
-                Ok((
-                    Box::new(SharedRecordingSink::default()) as Box<dyn InputSink>,
-                    Box::new(FixedScreen::with_displays(displays.to_vec()).with_scales(scales.to_vec()).with_os(os)) as Box<dyn ScreenInfo>,
-                ))
+                Ok(MeshBackends {
+                    source: Box::new(ChannelSource::new().0),
+                    sink: Box::new(SharedRecordingSink::default()),
+                    screen: Box::new(FixedScreen::with_displays(displays.to_vec()).with_scales(scales.to_vec()).with_os(os)),
+                })
             },
-            Duration::from_secs(1),
             std::sync::Arc::new(|_: &str| {}),
-        ));
+        )?;
+        // Whichever of the two dials, each knows where the other is.
+        model.set_peer_address(&name, &mesh.state().listening_on);
+        computers.push(mesh);
     }
-    Ok((model, Demo { _clients: clients }))
+    Ok((model, Demo { _computers: computers }))
 }
 
 /// Pairs two nodes with each other, both answering yes.
-fn pair(server: &Node, client: &Node) -> Result<(), AppError> {
-    let listener = server.listen("127.0.0.1:0")?;
+fn pair(first: &Node, second: &Node) -> Result<(), AppError> {
+    let listener = first.listen("127.0.0.1:0")?;
     let address = listener.local_addr()?.to_string();
     let waiting = thread::spawn(move || listener.accept_for_pairing(|_| true));
-    client.pair_with(&address, |_| true)?;
+    second.pair_with(&address, |_| true)?;
     waiting
         .join()
         .map_err(|_| AppError::Config("the demo pairing thread panicked".into()))??;

@@ -3,28 +3,15 @@
 
 /** What to say about the current state, and in what tone (muted, good, warn or accent). */
 export function statusOf(snap) {
-  if (snap.mode === 'share') {
-    const server = snap.server;
-    if (!server) return { tone: 'muted', text: '중지됨' };
-    if (server.active_screen !== snap.this_computer) {
-      return { tone: 'accent', text: `‘${server.active_screen}’ 조작 중` };
-    }
-    const count = server.clients.length;
-    if (count === 0) return { tone: 'warn', text: '공유 중 · 연결된 컴퓨터 없음' };
-    return { tone: 'good', text: `공유 중 · 컴퓨터 ${count}대 연결됨` };
+  const mesh = snap.mesh;
+  if (!mesh) return { tone: 'muted', text: '중지됨' };
+  if (mesh.controlled_by) return { tone: 'accent', text: `‘${mesh.controlled_by}’이(가) 조작 중` };
+  if (mesh.active_screen !== snap.this_computer) {
+    return { tone: 'accent', text: `‘${mesh.active_screen}’ 조작 중` };
   }
-
-  const client = snap.client;
-  switch (client && client.status) {
-    case 'connected':
-      return { tone: 'good', text: `‘${client.server}’에 연결됨` };
-    case 'connecting':
-      return { tone: 'warn', text: '연결하는 중…' };
-    case 'waiting':
-      return { tone: 'warn', text: '연결 끊김 · 다시 시도하는 중' };
-    default:
-      return { tone: 'muted', text: '중지됨' };
-  }
+  const count = mesh.peers.length;
+  if (count === 0) return { tone: 'warn', text: '연결 대기 중' };
+  return { tone: 'good', text: `연결됨 · 컴퓨터 ${count}대` };
 }
 
 // ---- the layout canvas ----
@@ -296,11 +283,18 @@ export function formatSize(screen) {
   return screen ? `${screen[0]} × ${screen[1]}` : null;
 }
 
-/** The address other computers should type to reach this one, once it is sharing. */
-export function shareAddress(snap) {
-  if (!snap.server) return null;
-  const port = snap.server.listening_on.split(':').pop();
-  return snap.lan_address ? `${snap.lan_address}:${port}` : snap.server.listening_on;
+/** The address other computers reach this one at, once it is running. */
+export function ownAddress(snap) {
+  if (!snap.mesh) return null;
+  const port = snap.mesh.listening_on.split(':').pop();
+  return snap.lan_address ? `${snap.lan_address}:${port}` : snap.mesh.listening_on;
+}
+
+/** The screen that has the cursor, from this computer's point of view: the one controlling it, if any. */
+export function cursorScreen(snap) {
+  const mesh = snap.mesh;
+  if (!mesh) return null;
+  return mesh.controlled_by || mesh.active_screen;
 }
 
 /** The address a waiting computer shows for pairing. */
@@ -362,33 +356,25 @@ export function tabsFor() {
 
 /**
  * What the status bar at the bottom says: a list of `{ tone, text }` (tone being muted, good,
- * warn or accent), and the address other computers connect to, when this one is sharing.
+ * warn or accent), and the address this computer can be reached at, when it is running.
  */
 export function statusBarOf(snap) {
   const items = [];
   const total = snap.devices.length;
+  const mesh = snap.mesh;
 
-  if (snap.mode === 'share') {
-    const server = snap.server;
-    // Listening is not yet sharing: until another computer has connected, nothing is shared.
-    if (!server) items.push({ tone: 'muted', text: '공유 중지됨' });
-    else if (server.clients.length === 0) items.push({ tone: 'warn', text: '연결 대기 중' });
-    else items.push({ tone: 'good', text: '공유 중' });
-    if (server) {
-      items.push({
-        tone: server.clients.length > 0 ? 'good' : 'warn',
-        text: total === 0 ? '페어링한 컴퓨터 없음' : `온라인 ${server.clients.length} / ${total}대`,
-      });
-      if (server.active_screen !== snap.this_computer) {
-        items.push({ tone: 'accent', text: `‘${server.active_screen}’ 조작 중` });
-      }
-    } else {
-      items.push({ tone: 'muted', text: total === 0 ? '페어링한 컴퓨터 없음' : `페어링 ${total}대` });
-    }
-    return { items, address: shareAddress(snap) };
+  // Running is not yet connected: until another computer has connected, nothing is shared.
+  if (!mesh) {
+    items.push({ tone: 'muted', text: '중지됨' });
+    items.push({ tone: 'muted', text: total === 0 ? '페어링한 컴퓨터 없음' : `페어링 ${total}대` });
+    return { items, address: null };
   }
 
   const status = statusOf(snap);
   items.push({ tone: status.tone, text: status.text });
-  return { items, address: null };
+  items.push({
+    tone: mesh.peers.length > 0 ? 'good' : 'warn',
+    text: total === 0 ? '페어링한 컴퓨터 없음' : `온라인 ${mesh.peers.length} / ${total}대`,
+  });
+  return { items, address: ownAddress(snap) };
 }

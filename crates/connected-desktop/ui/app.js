@@ -19,7 +19,8 @@ import {
   overlapRegions,
   panBy,
   pairingAddress,
-  shareAddress,
+  ownAddress,
+  cursorScreen,
   snapPosition,
   statusBarOf,
   statusOf,
@@ -57,7 +58,6 @@ let tab = null;
 let lastKey = '';
 let overlayKey = null;
 let builtView = null;
-let builtSettingsMode = null;
 let forgetting = null; // the computer the person is being asked to forget
 let pairAddress = ''; // what has been typed as the address to pair with
 let localError = null;
@@ -74,28 +74,15 @@ let restartIn = null; // seconds until the restart, while counting down
 let restartTimer = null;
 let spaceDown = false; // while Space is held, dragging the canvas moves the view
 
-/**
- * The computers on the layout: what this computer arranged when it shares, and what the
- * sharing computer arranged (sent over, with this computer marked) when it receives.
- */
+/** The computers on the layout: this one and the others placed. Every computer shares the same layout. */
 function layoutScreens() {
-  return snap.mode === 'receive' ? snap.remote_layout || [] : snap.screens;
+  return snap.screens;
 }
 
-/** What the layout calls this computer: the sharing computer may know it by another name. */
+/** What the layout calls this computer. */
 function localName() {
   const mine = layoutScreens().find((screen) => screen.local);
   return mine ? mine.name : snap.this_computer;
-}
-
-/** The layout a receiving computer shows is the sharing computer's; it can only be looked at. */
-function layoutReadOnly() {
-  return snap.mode === 'receive';
-}
-
-/** Whether there is a layout to draw: always when sharing; when receiving, once one arrived. */
-function hasLayout() {
-  return snap.mode === 'share' || (snap.remote_layout || []).length > 0;
 }
 
 /** The computer whose monitors and details are shown: the one, when just one is selected. */
@@ -270,9 +257,9 @@ function renderTabs() {
 function renderView() {
   const view = $('view');
   // The layout fills the window; the other tabs sit in a padded page.
-  view.classList.toggle('full', (tab === 'layout' && hasLayout()) || tab === 'settings');
+  view.classList.toggle('full', tab === 'layout' || tab === 'settings');
   switch (tab) {
-    case 'layout': return hasLayout() ? layoutView(view) : receivingLayoutView(view);
+    case 'layout': return layoutView(view);
     case 'devices': return devicesView(view);
     case 'activity': return activityView(view);
     case 'settings': return settingsView(view);
@@ -322,7 +309,6 @@ function buildLayout() {
       h('button', { type: 'button', title: '축소', text: '−', on: { click: () => zoomBy(1 / 1.25) } }),
       h('button', { type: 'button', class: 'level', id: 'zoom-level', title: '전체가 보이게 맞추기', on: { click: fitAll } }),
       h('button', { type: 'button', title: '확대', text: '+', on: { click: () => zoomBy(1.25) } })),
-    layoutReadOnly() && h('div', { class: 'readonly float', text: '읽기 전용 · 공유하는 컴퓨터의 배치' }),
     h('div', { class: 'side' }, buildDetail()));
 }
 
@@ -462,7 +448,7 @@ function paintCanvas(canvas) {
   const height = canvas.clientHeight;
   if (width === 0 || height === 0) return;
 
-  const active = snap.server ? snap.server.active_screen : null;
+  const active = cursorScreen(snap);
   const lost = new Set(unreachable(layoutScreens(), localName()));
   const { fit, view } = currentView(canvas);
   canvasState = { canvas, view, fit };
@@ -711,14 +697,14 @@ function buildDetail() {
   const screen = layoutScreens().find((candidate) => candidate.name === sole());
   if (!screen) return null;
   const device = snap.devices.find((candidate) => candidate.name === screen.name);
-  const active = snap.server ? snap.server.active_screen : null;
+  const active = cursorScreen(snap);
 
   const facts = [];
   const fact = (label, value) => facts.push(h('div', { class: 'fact' },
     h('span', { class: 'label', text: label }), h('span', { class: 'value', text: value })));
   if (screen.local) {
     fact('상태', '이 컴퓨터');
-    const address = shareAddress(snap);
+    const address = ownAddress(snap);
     if (address) fact('주소', address);
     fact('지문', snap.fingerprint_short);
   } else if (device) {
@@ -744,7 +730,7 @@ function buildDetail() {
     h('div', { class: 'head' },
       osMark(screen.os, 18),
       h('h3', { text: screen.name, title: screen.name }),
-      screen.local || layoutReadOnly() ? null : iconButton('remove', '배치에서 빼기', () => {
+      screen.local ? null : iconButton('remove', '배치에서 빼기', () => {
         deselect();
         act('remove_from_layout', { device: screen.name });
       }),
@@ -931,8 +917,6 @@ function drawPreview(target) {
 function onDragMove(event) {
   if (!drag) return;
   if (!drag.active) {
-    // A layout that is only looked at cannot be picked up; pressing and letting go still selects.
-    if (layoutReadOnly()) return;
     if (Math.hypot(event.clientX - drag.pressedAt.x, event.clientY - drag.pressedAt.y) < DRAG_START_PX) return;
     startCarrying();
   }
@@ -1007,17 +991,6 @@ function onDragKey(event) {
 
 // ---- the other tabs ----
 
-/** In receive mode the layout is the sharing computer's, and shows once this computer has connected to it. */
-function receivingLayoutView(view) {
-  view.replaceChildren(h('section', { class: 'stack' },
-    h('h2', { text: '레이아웃' }),
-    h('p', {
-      class: 'muted',
-      text: '이 컴퓨터는 다른 컴퓨터의 키보드와 마우스를 받는 쪽입니다. 화면 배치는 공유하는 컴퓨터에서 하고, 그 컴퓨터에 연결되면 여기에 같은 배치가 보입니다. 이 컴퓨터를 공유하는 쪽으로 쓰려면 ‘설정’에서 바꾸세요.',
-    })));
-  builtView = null;
-}
-
 // ---- settings ----
 //
 // Like the settings of a chat program: the page takes over the whole window, with the
@@ -1031,7 +1004,6 @@ let previousTab = 'layout';
 function settingsCategories() {
   return [
     ['이 컴퓨터', [['account', '내 정보']]],
-    ['공유', [['mode', '사용 방식'], ...(snap.mode === 'receive' ? [['connection', '연결할 컴퓨터']] : [])]],
     ['앱', [['permissions', '권한'], ['help', '도움말']]],
   ];
 }
@@ -1043,8 +1015,7 @@ function closeSettings() {
 }
 
 function settingsView(view) {
-  if (settingsPage === 'connection' && snap.mode !== 'receive') settingsPage = 'mode';
-  if (builtView !== 'settings' || builtSettingsMode !== `${snap.mode}/${settingsPage}`) {
+  if (builtView !== 'settings') {
     view.replaceChildren(h('div', { class: 'settings-page' },
       h('nav', { class: 'settings-nav' },
         ...settingsCategories().flatMap(([title, items]) => [
@@ -1066,32 +1037,9 @@ function settingsView(view) {
           on: { click: closeSettings },
         }, icon('close', 18, 'inline'), h('span', { text: 'ESC' })))));
     builtView = 'settings';
-    builtSettingsMode = `${snap.mode}/${settingsPage}`;
   }
 
   // What changes while the page is open.
-  for (const button of view.querySelectorAll('#mode button')) {
-    button.classList.toggle('on', button.id === `mode-${snap.mode}`);
-    button.disabled = snap.running;
-  }
-  const mode = document.getElementById('mode');
-  if (mode) mode.classList.toggle('locked', snap.running);
-  const note = document.getElementById('mode-note');
-  if (note) {
-    note.textContent = snap.running
-      ? '실행 중에는 바꿀 수 없습니다. 아래 상태 표시줄에서 먼저 중지하세요.'
-      : snap.mode === 'share'
-        ? '이 컴퓨터의 키보드와 마우스로 다른 컴퓨터를 조작합니다.'
-        : '다른 컴퓨터의 키보드와 마우스로 이 컴퓨터를 조작합니다.';
-  }
-  const input = document.getElementById('server-address');
-  if (input) {
-    // The address box is left alone while the person is typing in it.
-    input.placeholder = `예: 192.168.0.12  (포트 ${snap.server_port}는 생략 가능)`;
-    input.disabled = snap.running;
-    if (document.activeElement !== input && input.value !== snap.server_address) input.value = snap.server_address;
-    $('connection-status').replaceChildren(...connectionStatus());
-  }
   const permissions = document.getElementById('permissions');
   if (permissions) permissions.replaceChildren(...permissionRows());
 }
@@ -1131,45 +1079,6 @@ function permissionRows() {
 function settingsContent() {
   const local = layoutScreens().find((screen) => screen.local);
   switch (settingsPage) {
-    case 'mode': {
-      const modeButton = (mode, label) => h('button', {
-        type: 'button',
-        id: `mode-${mode}`,
-        text: label,
-        on: {
-          click: () => {
-            if (!snap || snap.running || snap.mode === mode) return;
-            builtView = null;
-            act('set_mode', { mode });
-          },
-        },
-      });
-      return [
-        h('h2', { text: '사용 방식' }),
-        h('div', { id: 'mode', class: 'segmented', role: 'group', 'aria-label': '사용 방식' },
-          modeButton('share', '이 컴퓨터 공유'), modeButton('receive', '다른 컴퓨터에서 받기')),
-        h('p', { id: 'mode-note', class: 'muted' }),
-      ];
-    }
-    case 'connection':
-      return [
-        h('h2', { text: '연결할 컴퓨터' }),
-        h('p', {
-          class: 'muted',
-          text: '다른 컴퓨터에서 ‘이 컴퓨터 공유’로 시작하면 그 컴퓨터가 알려 주는 주소를 아래에 입력하세요. 처음이라면 먼저 ‘기기’ 탭에서 그 컴퓨터와 페어링해야 합니다.',
-        }),
-        h('div', { class: 'field' },
-          h('label', { for: 'server-address', text: '주소' }),
-          h('input', {
-            type: 'text',
-            id: 'server-address',
-            value: snap.server_address,
-            autocomplete: 'off',
-            spellcheck: false,
-            on: { input: (event) => api('set_server_address', { address: event.target.value }).catch(() => {}) },
-          })),
-        h('div', { id: 'connection-status' }),
-      ];
     case 'permissions':
       return [
         h('h2', { text: '권한' }),
@@ -1184,7 +1093,8 @@ function settingsContent() {
           helpItem('확대·축소와 이동', '휠이나 트랙패드 핀치로 확대·축소합니다. 화면을 옮기려면 Space를 누른 채(또는 마우스 가운데 버튼으로) 끄세요. 왼쪽 아래의 퍼센트를 누르면 전체가 보이게 맞춥니다.'),
           helpItem('여러 대 한꺼번에', '빈 곳을 끌어 사각형을 그리면 닿은 컴퓨터가 모두 선택됩니다. Shift를 누르고 컴퓨터를 누르면 하나씩 더하거나 뺄 수 있고, 선택한 것 중 하나를 끌면 모두 같이 움직입니다. Esc나 빈 곳을 누르면 선택이 풀립니다.'),
           helpItem('자세히 보기', '컴퓨터를 누르면 모니터마다 해상도와 배율이 보이고, 오른쪽에 자세한 정보가 뜹니다.'),
-          helpItem('되돌아오기', '마우스가 다른 컴퓨터에 있을 때 Ctrl+Shift+Alt+Esc 를 누르면 이 컴퓨터로 돌아옵니다.'),
+          helpItem('서로 연결', '페어링한 컴퓨터는 모두 서로 연결되어 있고, 누가 호스트인 것은 아닙니다. 마우스를 화면 가장자리 밖으로 밀어 먼저 다른 컴퓨터로 넘어간 쪽이 우선권을 가지고, 마우스가 돌아올 때까지 그 컴퓨터를 조작합니다. 조작당하는 동안 그 컴퓨터의 키보드와 마우스는 잠깁니다.'),
+          helpItem('되돌아오기', 'Ctrl+Shift+Alt+Esc 를 누르면 마우스를 되찾습니다. 다른 컴퓨터로 넘어가 있을 때도, 다른 컴퓨터가 이 컴퓨터를 조작 중일 때도 같습니다.'),
           helpItem('컴퓨터 추가', '오른쪽 위의 ‘컴퓨터 추가’로 페어링합니다. 두 컴퓨터에 같은 확인 코드가 보이는지 확인하세요.')),
       ];
     default:
@@ -1210,27 +1120,6 @@ function helpItem(title, text) {
   return h('div', { class: 'help-item' }, h('strong', { text: title }), h('p', { class: 'muted', text }));
 }
 
-function connectionStatus() {
-  const client = snap.client;
-  switch (client && client.status) {
-    case 'connected':
-      return [
-        h('p', { class: 'ok', text: `‘${client.server}’에 연결되었습니다.` }),
-        h('p', { class: 'muted', text: '그 컴퓨터에서 마우스를 이 컴퓨터가 놓인 쪽 화면 가장자리 밖으로 밀면 이쪽으로 넘어옵니다.' }),
-      ];
-    case 'connecting':
-      return [h('div', { class: 'inline' }, h('div', { class: 'spinner' }), '연결하는 중…')];
-    case 'waiting':
-      return [
-        h('div', { class: 'inline tone-warn' }, h('div', { class: 'spinner' }),
-          h('strong', { text: '연결이 끊겼습니다. 다시 시도하는 중…' })),
-        h('p', { class: 'muted small', text: client.reason }),
-      ];
-    default:
-      return [h('p', { class: 'muted', text: '‘시작’을 누르면 연결합니다.' })];
-  }
-}
-
 function devicesView(view) {
   view.replaceChildren(h('div', { class: 'stack' },
     h('div', { class: 'section-head' },
@@ -1249,17 +1138,20 @@ function addToLayout(device) {
   act('place_device', { device: device.name, x: right, y: local ? local.y : 0 });
 }
 
+const addressDrafts = new Map(); // what the person is typing as a device's address, until they are done
+
 function deviceCard(device) {
   const placed = isPlaced(layoutScreens(), device.name);
-  const address = snap.server ? shareAddress(snap) : null;
-  // Paired is not connected: a computer is online only while it is connected to this one, which
-  // takes this computer to be running and the other to connect to it. Say so where it is missed.
+  // Paired is not connected: a computer is online only while it is connected to this one. Say
+  // what is missing where it is missed.
   let hint = null;
-  if (!device.online && snap.mode === 'share') {
-    hint = address
-      ? `이 컴퓨터는 접속을 기다리는 중입니다. 그 컴퓨터에서 ‘설정 → 사용 방식 → 다른 컴퓨터에서 받기’를 고르고, 주소 ${address} 를 입력한 뒤 ‘시작’을 누르세요.`
-      : '접속을 받으려면 먼저 아래 상태 표시줄의 ‘시작’을 누르세요.';
+  if (!snap.running) hint = '이 컴퓨터가 멈춰 있습니다. 아래 상태 표시줄의 ‘시작’을 누르면 연결합니다.';
+  else if (!device.online && !device.address) {
+    hint = '그 컴퓨터의 주소를 알아야 연결할 수 있습니다. 아래에 주소를 입력하세요.';
+  } else if (!device.online) {
+    hint = '그 컴퓨터에서도 Connected가 켜져 있어야 서로 연결됩니다. 같은 네트워크인지, 주소가 맞는지 확인하세요.';
   }
+  const inputId = `address-${device.name}`;
   return h('div', { class: 'card' },
     h('div', { class: 'device-row' },
       h('span', { class: `dot ${device.online ? 'good' : ''}` }),
@@ -1278,6 +1170,23 @@ function deviceCard(device) {
         class: 'small-btn bad',
         text: '삭제',
         on: { click: () => { forgetting = device.name; renderOverlay(); } },
+      })),
+    h('div', { class: 'field compact' },
+      h('label', { for: inputId, text: '주소' }),
+      h('input', {
+        type: 'text',
+        id: inputId,
+        value: addressDrafts.has(device.name) ? addressDrafts.get(device.name) : device.address || '',
+        placeholder: `예: 192.168.0.12  (포트 ${snap.mesh_port}는 생략 가능)`,
+        autocomplete: 'off',
+        spellcheck: false,
+        on: {
+          input: (event) => addressDrafts.set(device.name, event.target.value),
+          change: (event) => {
+            addressDrafts.delete(device.name);
+            act('set_peer_address', { device: device.name, address: event.target.value });
+          },
+        },
       })),
     hint && h('p', { class: 'muted small hint-line', text: hint }));
 }

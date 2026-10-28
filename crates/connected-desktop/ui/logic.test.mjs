@@ -17,7 +17,8 @@ import {
   monitorFacts,
   overlapRegions,
   pairingAddress,
-  shareAddress,
+  ownAddress,
+  cursorScreen,
   snapPosition,
   statusOf,
   statusBarOf,
@@ -29,41 +30,43 @@ import {
   panBy,
 } from './logic.js';
 
-const sharing = (extra = {}) => ({
-  mode: 'share',
+const running = (extra = {}) => ({
   this_computer: 'desk',
   lan_address: '192.168.1.5',
-  server: { listening_on: '0.0.0.0:24900', active_screen: 'desk', clients: [] },
-  client: null,
+  mesh: { listening_on: '0.0.0.0:24900', active_screen: 'desk', controlled_by: null, peers: [] },
   ...extra,
 });
 
-test('a computer that is not sharing says it is stopped', () => {
-  assert.deepEqual(statusOf(sharing({ server: null })), { tone: 'muted', text: '중지됨' });
+const meshOf = (extra) => ({ listening_on: '0.0.0.0:24900', active_screen: 'desk', controlled_by: null, peers: [], ...extra });
+
+test('a computer that is not running says it is stopped', () => {
+  assert.deepEqual(statusOf(running({ mesh: null })), { tone: 'muted', text: '중지됨' });
 });
 
-test('sharing with nobody connected is a warning', () => {
-  assert.deepEqual(statusOf(sharing()), { tone: 'warn', text: '공유 중 · 연결된 컴퓨터 없음' });
+test('running with nobody connected is a warning', () => {
+  assert.deepEqual(statusOf(running()), { tone: 'warn', text: '연결 대기 중' });
 });
 
-test('sharing with computers connected counts them', () => {
-  const clients = [{ name: 'a' }, { name: 'b' }];
-  const snap = sharing({ server: { listening_on: ':1', active_screen: 'desk', clients } });
-  assert.deepEqual(statusOf(snap), { tone: 'good', text: '공유 중 · 컴퓨터 2대 연결됨' });
+test('running with computers connected counts them', () => {
+  const snap = running({ mesh: meshOf({ peers: [{ name: 'a' }, { name: 'b' }] }) });
+  assert.deepEqual(statusOf(snap), { tone: 'good', text: '연결됨 · 컴퓨터 2대' });
 });
 
 test('while the cursor is on another computer, the status names it', () => {
-  const snap = sharing({ server: { listening_on: ':1', active_screen: 'laptop', clients: [{}] } });
+  const snap = running({ mesh: meshOf({ active_screen: 'laptop', peers: [{}] }) });
   assert.deepEqual(statusOf(snap), { tone: 'accent', text: '‘laptop’ 조작 중' });
 });
 
-test('a receiving computer reports each state of its link', () => {
-  const receiving = (client) => statusOf({ mode: 'receive', this_computer: 'x', client });
-  assert.equal(receiving({ status: 'connected', server: 'desk' }).text, '‘desk’에 연결됨');
-  assert.equal(receiving({ status: 'connecting' }).tone, 'warn');
-  assert.equal(receiving({ status: 'waiting', reason: 'refused' }).text, '연결 끊김 · 다시 시도하는 중');
-  assert.equal(receiving(null).text, '중지됨');
-  assert.equal(receiving({ status: 'failed', reason: 'x' }).tone, 'muted');
+test('while another computer controls this one, the status names it', () => {
+  const snap = running({ mesh: meshOf({ controlled_by: 'laptop', peers: [{}] }) });
+  assert.deepEqual(statusOf(snap), { tone: 'accent', text: '‘laptop’이(가) 조작 중' });
+  assert.equal(cursorScreen(snap), 'laptop');
+});
+
+test('the cursor is on this computer unless it is away or another has it here', () => {
+  assert.equal(cursorScreen(running()), 'desk');
+  assert.equal(cursorScreen(running({ mesh: meshOf({ active_screen: 'tv' }) })), 'tv');
+  assert.equal(cursorScreen(running({ mesh: null })), null);
 });
 
 const screen = (name, x, y, width = 100, height = 100) => ({ name, x, y, width, height });
@@ -310,29 +313,29 @@ test('screen sizes read as width by height', () => {
   assert.equal(formatSize(null), null);
 });
 
-test('the address to type is the local network address with the server port', () => {
-  assert.equal(shareAddress(sharing()), '192.168.1.5:24900');
-  assert.equal(shareAddress(sharing({ lan_address: null })), '0.0.0.0:24900');
-  assert.equal(shareAddress(sharing({ server: null })), null);
+test('this computer is reached at the local network address with the port', () => {
+  assert.equal(ownAddress(running()), '192.168.1.5:24900');
+  assert.equal(ownAddress(running({ lan_address: null })), '0.0.0.0:24900');
+  assert.equal(ownAddress(running({ mesh: null })), null);
   assert.equal(pairingAddress({ lan_address: '10.0.0.2' }, '0.0.0.0:24901'), '10.0.0.2:24901');
   assert.equal(pairingAddress({ lan_address: null }, '0.0.0.0:24901'), '0.0.0.0:24901');
 });
 
-test('the navigation bar has the same four tabs in either mode', () => {
+test('the navigation bar has four tabs', () => {
   assert.deepEqual(tabsFor().map(([id]) => id), ['layout', 'devices', 'activity', 'settings']);
   assert.deepEqual(tabsFor().map(([, label]) => label), ['레이아웃', '기기', '활동', '설정']);
 });
 
 const devices = (count) => Array.from({ length: count }, (_, i) => ({ name: `d${i}` }));
 
-test('the status bar says whether this computer is sharing and how many are online', () => {
-  const snap = sharing({
+test('the status bar says whether this computer is connected and how many are online', () => {
+  const snap = running({
     devices: devices(4),
-    server: { listening_on: '0.0.0.0:24900', active_screen: 'desk', clients: [{ name: 'a' }, { name: 'b' }] },
+    mesh: meshOf({ peers: [{ name: 'a' }, { name: 'b' }] }),
   });
   assert.deepEqual(statusBarOf(snap), {
     items: [
-      { tone: 'good', text: '공유 중' },
+      { tone: 'good', text: '연결됨 · 컴퓨터 2대' },
       { tone: 'good', text: '온라인 2 / 4대' },
     ],
     address: '192.168.1.5:24900',
@@ -340,40 +343,26 @@ test('the status bar says whether this computer is sharing and how many are onli
 });
 
 test('the status bar says whose input it is when the cursor is on another computer', () => {
-  const snap = sharing({
+  const snap = running({
     devices: devices(1),
-    server: { listening_on: '0.0.0.0:24900', active_screen: 'laptop', clients: [{ name: 'laptop' }] },
+    mesh: meshOf({ active_screen: 'laptop', peers: [{ name: 'laptop' }] }),
   });
-  assert.deepEqual(statusBarOf(snap).items.at(-1), { tone: 'accent', text: '‘laptop’ 조작 중' });
+  assert.deepEqual(statusBarOf(snap).items[0], { tone: 'accent', text: '‘laptop’ 조작 중' });
 });
 
-test('a sharing computer with nobody online is a warning, and a stopped one just counts', () => {
-  const idle = statusBarOf(sharing({
-    devices: devices(2),
-    server: { listening_on: ':1', active_screen: 'desk', clients: [] },
-  }));
+test('a running computer with nobody online is a warning, and a stopped one just counts', () => {
+  const idle = statusBarOf(running({ devices: devices(2) }));
   assert.deepEqual(idle.items, [
     { tone: 'warn', text: '연결 대기 중' },
     { tone: 'warn', text: '온라인 0 / 2대' },
   ]);
 
-  const stopped = statusBarOf(sharing({ devices: devices(3), server: null }));
+  const stopped = statusBarOf(running({ devices: devices(3), mesh: null }));
   assert.deepEqual(stopped, {
-    items: [{ tone: 'muted', text: '공유 중지됨' }, { tone: 'muted', text: '페어링 3대' }],
+    items: [{ tone: 'muted', text: '중지됨' }, { tone: 'muted', text: '페어링 3대' }],
     address: null,
   });
-  assert.equal(statusBarOf(sharing({ devices: [], server: null })).items[1].text, '페어링한 컴퓨터 없음');
-});
-
-test('a receiving computer shows how it is connected, and has no address', () => {
-  const bar = statusBarOf({
-    mode: 'receive',
-    this_computer: 'laptop',
-    devices: [],
-    server: null,
-    client: { status: 'connected', server: 'desk' },
-  });
-  assert.deepEqual(bar, { items: [{ tone: 'good', text: '‘desk’에 연결됨' }], address: null });
+  assert.equal(statusBarOf(running({ devices: [], mesh: null })).items[1].text, '페어링한 컴퓨터 없음');
 });
 
 test('each permission is given on its own page of the system settings', () => {

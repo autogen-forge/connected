@@ -12,27 +12,18 @@ use crate::error::{AppError, Result};
 const FILE: &str = "settings.json";
 const DEFAULT_PORT_ADDRESS: &str = "0.0.0.0:24900";
 
-/// What this computer does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    /// Share this computer's keyboard and mouse with others.
-    #[default]
-    Share,
-    /// Take keyboard and mouse from another computer.
-    Receive,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub mode: Mode,
-    /// The address a sharing computer listens on.
+    /// The address this computer listens on for the others.
     pub listen: String,
-    /// The address a receiving computer connects to.
-    pub server_address: String,
+    /// Where to reach each paired computer, as `address:port`, by name.
+    pub peer_addresses: BTreeMap<String, String>,
     /// Where each paired computer sits relative to this one.
     pub arrangement: Arrangement,
+    /// When the arrangement was last changed, in milliseconds; the newest one among the
+    /// computers is the one they all use. 0 if it was never changed.
+    pub layout_version: u64,
     /// The displays each paired computer had when it last connected, so that its place on
     /// the layout can be drawn to scale while it is switched off.
     pub known_screens: BTreeMap<String, Vec<Rect>>,
@@ -45,10 +36,10 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            mode: Mode::default(),
             listen: DEFAULT_PORT_ADDRESS.to_owned(),
-            server_address: String::new(),
+            peer_addresses: BTreeMap::new(),
             arrangement: Arrangement::default(),
+            layout_version: 0,
             known_screens: BTreeMap::new(),
             known_scales: BTreeMap::new(),
             known_os: BTreeMap::new(),
@@ -116,14 +107,14 @@ mod tests {
         let (settings, note) = Settings::load(&temp_dir("none"));
         assert_eq!(settings, Settings::default());
         assert!(note.is_none());
-        assert_eq!(settings.mode, Mode::Share);
         assert_eq!(settings.listen, "0.0.0.0:24900");
     }
 
     #[test]
     fn settings_survive_a_save_and_load() {
         let dir = temp_dir("roundtrip");
-        let mut settings = Settings { mode: Mode::Receive, server_address: "10.0.0.5:24900".into(), ..Settings::default() };
+        let mut settings = Settings { layout_version: 42, ..Settings::default() };
+        settings.peer_addresses.insert("laptop".into(), "10.0.0.5:24900".into());
         let devices = BTreeMap::new();
         let local = [Rect::new(0, 0, 1920, 1080)];
         let metrics = Metrics { this_computer: "desk", local: &local, devices: &devices };
@@ -141,10 +132,10 @@ mod tests {
     fn missing_fields_fall_back_to_defaults() {
         let dir = temp_dir("partial");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(FILE), r#"{ "mode": "receive" }"#).unwrap();
+        fs::write(dir.join(FILE), r#"{ "mode": "receive", "layout_version": 7 }"#).unwrap();
 
         let (loaded, note) = Settings::load(&dir);
-        assert_eq!(loaded.mode, Mode::Receive);
+        assert_eq!(loaded.layout_version, 7);
         assert_eq!(loaded.listen, "0.0.0.0:24900");
         assert!(note.is_none());
         let _ = fs::remove_dir_all(&dir);

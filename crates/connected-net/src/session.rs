@@ -18,6 +18,8 @@ const READ_CHUNK: usize = 16 * 1024;
 pub struct Peer {
     pub name: String,
     pub fingerprint: Fingerprint,
+    /// The network address the other device is at, as this one sees it.
+    pub address: Option<std::net::IpAddr>,
 }
 
 enum Tls {
@@ -124,8 +126,12 @@ impl Session {
             .peer_fingerprint()
             .ok_or_else(|| NetError::Protocol("the peer sent no certificate".into()))?;
 
-        let mut session =
-            Self { tls, inbox: Vec::new(), peer: Peer { name: String::new(), fingerprint } };
+        let address = tls.tcp().peer_addr().ok().map(|addr| addr.ip());
+        let mut session = Self {
+            tls,
+            inbox: Vec::new(),
+            peer: Peer { name: String::new(), fingerprint, address },
+        };
         session.send(&Message::Hello { version: PROTOCOL_VERSION, name: my_name.to_owned() })?;
         match session.recv_timeout(HANDSHAKE_TIMEOUT)? {
             Some(Message::Hello { version, name }) if version == PROTOCOL_VERSION => {

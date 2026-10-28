@@ -391,6 +391,9 @@ main.full { padding: 0; overflow: hidden; position: relative; }
 .device-row .grow { flex: 1; }
 
 .field { display: flex; align-items: center; gap: 12px; margin: 14px 0 6px; }
+.field.compact { margin: 12px 0 0; }
+.field.compact label { color: var(--muted); font-size: 13px; }
+.field.compact input { flex: 1; max-width: 340px; }
 input[type="text"] {
   font: inherit;
   padding: 8px 12px;
@@ -540,4 +543,3 @@ body.settings-open #nav, body.settings-open #statusbar { display: none; }
 .step .guide p { margin: 0; }
 
 .hint-line { margin: 8px 0 0; user-select: text; -webkit-user-select: text; }
-.readonly { top: 14px; left: 14px; padding: 6px 12px; font-size: 12.5px; color: var(--muted); border-radius: 999px; }

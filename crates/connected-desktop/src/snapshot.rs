@@ -6,12 +6,11 @@
 
 use std::collections::BTreeMap;
 
-use connected_app::{ClientStatus, Mode};
 use connected_core::{Os, Rect, default_displays};
 use serde::Serialize;
 
 use crate::model::{
-    AppModel, Device, PAIRING_PORT, PairingStage, SERVER_PORT, lan_address,
+    AppModel, Device, MESH_PORT, PAIRING_PORT, PairingStage, lan_address,
 };
 use crate::state::AppState;
 
@@ -23,23 +22,18 @@ pub struct Snapshot {
     pub this_computer: String,
     pub fingerprint: String,
     pub fingerprint_short: String,
-    pub mode: Mode,
-    /// Whether sharing or receiving is on.
+    /// Whether this computer is connecting to the others.
     pub running: bool,
-    pub server_port: u16,
+    pub mesh_port: u16,
     pub pairing_port: u16,
     /// This computer's address on the local network, if it has one.
     pub lan_address: Option<String>,
     /// True when the app is running with stand-in computers.
     pub demo: bool,
-    pub server: Option<ServerView>,
-    pub client: Option<ClientView>,
+    pub mesh: Option<MeshView>,
     /// This computer's screen and the placed ones, on the shared desktop.
     pub screens: Vec<ScreenView>,
-    /// While receiving: the layout the sharing computer sent, to show. Empty otherwise.
-    pub remote_layout: Option<Vec<ScreenView>>,
     pub devices: Vec<DeviceView>,
-    pub server_address: String,
     pub pairing: Option<PairingView>,
     pub notice: Option<String>,
     pub permissions: Vec<PermissionView>,
@@ -68,28 +62,22 @@ pub struct ScreenView {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ServerView {
+pub struct MeshView {
     pub listening_on: String,
-    /// The screen that has the cursor right now: this computer's name or a client's.
+    /// The screen that has the cursor right now: this computer's name or another's.
     pub active_screen: String,
-    pub clients: Vec<ConnectedClientView>,
+    /// The computer whose cursor is on this one, if there is one.
+    pub controlled_by: Option<String>,
+    pub peers: Vec<PeerView>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct ConnectedClientView {
+pub struct PeerView {
     pub name: String,
     pub width: i32,
     pub height: i32,
     pub displays: Vec<Rect>,
     pub from: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ClientView {
-    /// `connecting`, `connected`, `waiting` (link down, trying again), `failed` or `stopped`.
-    pub status: &'static str,
-    pub server: Option<String>,
-    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,7 +93,7 @@ pub struct DeviceView {
     pub displays: Vec<Rect>,
     /// The system it runs, as last reported.
     pub os: Os,
-    /// Where its connection comes from, while it is connected.
+    /// Where this computer reaches it, as `address:port`, if that is known.
     pub address: Option<String>,
 }
 
@@ -160,31 +148,24 @@ fn build(
         this_computer: model.this_computer().to_owned(),
         fingerprint: fingerprint.to_string(),
         fingerprint_short: fingerprint.short(),
-        mode: model.settings.mode,
         running: model.is_running(),
-        server_port: SERVER_PORT,
+        mesh_port: MESH_PORT,
         pairing_port: PAIRING_PORT,
         lan_address: lan_address(),
         demo,
-        server: model.server_state().map(|state| ServerView {
+        mesh: model.mesh_state().map(|state| MeshView {
             listening_on: state.listening_on,
             active_screen: state.active_screen,
-            clients: state
-                .clients
+            controlled_by: state.controlled_by,
+            peers: state
+                .peers
                 .into_iter()
-                .map(|client| {
-                    let (width, height) = client.size();
-                    ConnectedClientView {
-                        name: client.name,
-                        width,
-                        height,
-                        displays: client.displays,
-                        from: client.from,
-                    }
+                .map(|peer| {
+                    let (width, height) = peer.size();
+                    PeerView { name: peer.name, width, height, displays: peer.displays, from: peer.from }
                 })
                 .collect(),
         }),
-        client: model.client_status().map(client_view),
         screens: model
             .desktop()
             .screens()
@@ -214,12 +195,10 @@ fn build(
                 })
             })
             .collect(),
-        remote_layout: model.client_layout().map(|screens| screens.into_iter().filter_map(layout_view).collect()),
         devices: {
             let known = model.known_displays();
             device_list.iter().cloned().map(|device| device_view(device, &known, &systems)).collect()
         },
-        server_address: model.settings.server_address.clone(),
         pairing: model.pairing.as_ref().map(|flow| pairing_view(&flow.stage)),
         notice: model.notice.clone(),
         permissions: permissions
@@ -228,35 +207,6 @@ fn build(
             .collect(),
         logs: logs.into_iter().skip(skipped).collect(),
     }
-}
-
-/// A computer from the layout the sharing computer sent, as the window draws it.
-fn layout_view(screen: connected_proto::LayoutScreen) -> Option<ScreenView> {
-    let all = connected_proto::bounds(&screen.displays)?;
-    Some(ScreenView {
-        name: screen.name,
-        x: screen.x,
-        y: screen.y,
-        width: all.width,
-        height: all.height,
-        // "Local" is the computer this window belongs to, which the sender marked.
-        local: screen.you,
-        displays: screen.displays,
-        scales: screen.scales,
-        os: screen.os,
-        online: screen.online,
-    })
-}
-
-fn client_view(status: ClientStatus) -> ClientView {
-    let (status, server, reason) = match status {
-        ClientStatus::Connecting => ("connecting", None, None),
-        ClientStatus::Connected { server } => ("connected", Some(server), None),
-        ClientStatus::Waiting { reason } => ("waiting", None, Some(reason)),
-        ClientStatus::Failed { reason } => ("failed", None, Some(reason)),
-        ClientStatus::Stopped => ("stopped", None, None),
-    };
-    ClientView { status, server, reason }
 }
 
 fn device_view(

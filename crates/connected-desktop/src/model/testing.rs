@@ -2,32 +2,24 @@
 
 use std::time::{Duration, Instant};
 
-use connected_core::{InputSink, ScreenInfo};
+use connected_app::{MeshBackends, PairingSession};
 use connected_platform::mock::{ChannelSource, FixedScreen, SharedRecordingSink};
-use connected_app::{PairingSession, ServerBackends};
 
 use super::*;
 
 pub fn mock_backends() -> Backends {
     Backends {
-        server: Arc::new(|| {
+        mesh: Arc::new(|| {
             let (source, _input, _capture) = ChannelSource::new();
-            Ok(ServerBackends {
+            Ok(MeshBackends {
                 source: Box::new(source),
-                cursor_sink: Box::new(SharedRecordingSink::default()),
+                sink: Box::new(SharedRecordingSink::default()),
                 screen: Box::new(FixedScreen::new(1920, 1080)),
             })
-        }),
-        client: Arc::new(|| {
-            Ok((
-                Box::new(SharedRecordingSink::default()) as Box<dyn InputSink>,
-                Box::new(FixedScreen::new(2560, 1440)) as Box<dyn ScreenInfo>,
-            ))
         }),
         local_screen: Arc::new(|| Some((vec![Rect::new(0, 0, 1920, 1080)], vec![100]))),
     }
 }
-
 
 pub fn model(name: &str) -> AppModel {
     let mut model = AppModel::in_memory(name, mock_backends()).unwrap();

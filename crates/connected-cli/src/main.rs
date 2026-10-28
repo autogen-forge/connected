@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand};
-use connected_app::{ClientHandle, ClientStatus, Log, ServerBackends, ServerHandle};
+use connected_app::{Log, MeshBackends, MeshHandle, MeshStart, Settings, now_ms};
 use connected_core::{Arrangement, Metrics, default_displays};
 use connected_net::{Identity, Node, PairingPrompt, TrustStore};
 use connected_proto::Edge;
@@ -17,7 +17,7 @@ const DEFAULT_ADDR: &str = "0.0.0.0:24900";
 const TRUST_FILE: &str = "trusted_peers";
 
 #[derive(Parser)]
-#[command(name = "connected", version, about = "Share keyboard, mouse, clipboard and files across machines")]
+#[command(name = "connected", version, about = "Share keyboard and mouse across machines")]
 struct Cli {
     /// Where this device keeps its identity and the list of paired devices.
     #[arg(long, global = true, env = "CONNECTED_HOME", value_name = "DIR")]
@@ -54,26 +54,26 @@ enum Command {
     /// Stop trusting a paired device, named by its name or the start of its fingerprint.
     Forget { who: String },
 
-    /// Capture this machine's keyboard and mouse and share them with paired clients.
+    /// Connect to every paired device and share keyboard and mouse with all of them.
     ///
-    /// Push the cursor off the edge where a client sits to move over to it. To get back
-    /// without the mouse, press Ctrl+Shift+Alt+Esc. Ctrl-C stops the server.
-    Server {
+    /// Every computer runs this; nobody is the host. Push the cursor off the edge where
+    /// another computer sits to move over to it; whichever got there first has priority until
+    /// the cursor comes back. To get back without the mouse, press Ctrl+Shift+Alt+Esc.
+    /// Ctrl-C stops it. Places and addresses saved by the desktop app are used unless given here.
+    Run {
         /// Address to listen on.
         #[arg(long, default_value = DEFAULT_ADDR)]
         listen: String,
 
         /// A paired device and the side of this screen it sits on, e.g. `laptop=right`.
-        /// Give it once per client; each side holds one.
-        #[arg(long = "client", value_name = "NAME=EDGE", value_parser = parse_placement, required = true)]
-        clients: Vec<(String, Edge)>,
-    },
+        /// Give it once per device; each side holds one.
+        #[arg(long = "place", value_name = "NAME=EDGE", value_parser = parse_placement)]
+        places: Vec<(String, Edge)>,
 
-    /// Connect to a server and play back the keyboard and mouse it sends. Ctrl-C stops it.
-    Client {
-        /// Server address, host:port.
-        #[arg(long)]
-        server: String,
+        /// Where to reach a paired device, e.g. `laptop=192.168.0.7:24900`. Only the device
+        /// with the lower fingerprint of each pair dials, but both should know the other.
+        #[arg(long = "peer", value_name = "NAME=ADDR", value_parser = parse_peer)]
+        peers: Vec<(String, String)>,
     },
 
     /// Report which platform backends work on this machine.
@@ -96,8 +96,7 @@ fn main() -> Result<()> {
         Command::Pair { listen, connect } => pair(&home, cli.name, listen, connect),
         Command::Trusted => list_trusted(&home),
         Command::Forget { who } => forget(&home, &who),
-        Command::Server { listen, clients } => serve(&home, cli.name, &listen, clients),
-        Command::Client { server } => follow(&home, cli.name, &server),
+        Command::Run { listen, places, peers } => run(&home, cli.name, &listen, places, peers),
         Command::Check { request_permissions } => check(request_permissions),
     }
 }
@@ -193,78 +192,85 @@ fn parse_placement(text: &str) -> std::result::Result<(String, Edge), String> {
     Ok((name.to_owned(), edge))
 }
 
-fn serve(home: &Path, name: Option<String>, addr: &str, clients: Vec<(String, Edge)>) -> Result<()> {
-    let mut arrangement = Arrangement::default();
-    // Real sizes are only known once a computer connects; until then, one of the usual size
-    // is assumed, which is enough to tell that two cannot share a side.
-    let devices = BTreeMap::new();
-    let local = default_displays();
-    let metrics = Metrics { this_computer: "this computer", local: &local, devices: &devices };
-    for (device, edge) in clients {
-        if arrangement.contains(&device) {
-            bail!("'{device}' is placed twice");
-        }
-        arrangement
-            .place_beside_this_computer(&device, edge, &metrics)
-            .map_err(|err| anyhow::anyhow!("cannot place '{device}' on the {edge:?} side: {err}"))?;
+fn parse_peer(text: &str) -> std::result::Result<(String, String), String> {
+    let (name, address) = text.split_once('=').ok_or("expected NAME=ADDR, for example laptop=192.168.0.7:24900")?;
+    let (name, address) = (name.trim(), address.trim());
+    if name.is_empty() || address.is_empty() {
+        return Err("the device name and its address must both be given".into());
     }
+    Ok((name.to_owned(), address.to_owned()))
+}
+
+fn run(
+    home: &Path,
+    name: Option<String>,
+    addr: &str,
+    places: Vec<(String, Edge)>,
+    peers: Vec<(String, String)>,
+) -> Result<()> {
+    let (saved, problem) = Settings::load(home);
+    if let Some(problem) = problem {
+        eprintln!("warning: {problem}");
+    }
+    let mut start = MeshStart {
+        arrangement: saved.arrangement,
+        layout_version: saved.layout_version,
+        peer_addresses: saved.peer_addresses,
+    };
+
+    if !places.is_empty() {
+        let mut arrangement = Arrangement::default();
+        // Real sizes are only known once a computer connects; until then, one of the usual size
+        // is assumed, which is enough to tell that two cannot share a side.
+        let devices = BTreeMap::new();
+        let local = default_displays();
+        let metrics = Metrics { this_computer: "this computer", local: &local, devices: &devices };
+        for (device, edge) in places {
+            if arrangement.contains(&device) {
+                bail!("'{device}' is placed twice");
+            }
+            arrangement
+                .place_beside_this_computer(&device, edge, &metrics)
+                .map_err(|err| anyhow::anyhow!("cannot place '{device}' on the {edge:?} side: {err}"))?;
+        }
+        start.arrangement = arrangement;
+        start.layout_version = now_ms();
+    }
+    start.peer_addresses.extend(peers);
 
     let node = open_node(home, name)?;
     warn_about_missing_permissions();
     let stop = stop_on_ctrl_c()?;
 
-    let mut server = ServerHandle::start(
+    let mut mesh = MeshHandle::start(
         node.clone(),
         addr,
-        arrangement,
+        start,
         || {
-            Ok(ServerBackends {
+            Ok(MeshBackends {
                 source: connected_platform::open_source()?,
-                cursor_sink: connected_platform::open_sink()?,
+                sink: connected_platform::open_sink()?,
                 screen: connected_platform::open_screen()?,
             })
         },
         printer(),
     )
-    .context("cannot start the server")?;
+    .context("cannot start")?;
 
     println!(
-        "'{}' is serving on {}. Ctrl-C stops it; Ctrl+Shift+Alt+Esc brings the cursor back.",
+        "'{}' is listening on {}. Ctrl-C stops it; Ctrl+Shift+Alt+Esc brings the cursor back.",
         node.identity().name(),
-        server.state().listening_on
+        mesh.state().listening_on
     );
-    while !stop.load(Ordering::SeqCst) && server.is_running() {
+    while !stop.load(Ordering::SeqCst) && mesh.is_running() {
         sleep(Duration::from_millis(100));
     }
-    server.stop();
+    mesh.stop();
 
-    match server.state().error {
-        Some(error) => bail!("the server stopped: {error}"),
+    match mesh.state().error {
+        Some(error) => bail!("stopped: {error}"),
         None => Ok(()),
     }
-}
-
-fn follow(home: &Path, name: Option<String>, server: &str) -> Result<()> {
-    let node = open_node(home, name)?;
-    warn_about_missing_permissions();
-    let stop = stop_on_ctrl_c()?;
-
-    println!("Connecting to {server}, and reconnecting if the link drops. Ctrl-C stops it.");
-    let mut client = ClientHandle::start(
-        node,
-        server.to_owned(),
-        || Ok((connected_platform::open_sink()?, connected_platform::open_screen()?)),
-        Duration::from_secs(3),
-        printer(),
-    );
-    while !stop.load(Ordering::SeqCst) {
-        if let ClientStatus::Failed { reason } = client.status() {
-            bail!("the client cannot run: {reason}");
-        }
-        sleep(Duration::from_millis(100));
-    }
-    client.stop();
-    Ok(())
 }
 
 fn printer() -> Log {
