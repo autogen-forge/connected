@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: [self-hosted, windows, x64]   # 내 Windows 러너에서만 빌드한다 (warframe-guidance 와 같은 방식)
+    runs-on: windows-latest   # GitHub 호스트 러너. 공개 저장소라 조직의 self-hosted 러너를 쓰지 않는다
     timeout-minutes: 60
     steps:
       - name: 소스 받기

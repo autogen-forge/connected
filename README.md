@@ -19,7 +19,7 @@ Windows 설치 파일은 `bun run --cwd crates/connected-desktop tauri build --b
 
 GitHub Actions에서 빌드됩니다.
 
-- **Build Windows** (`.github/workflows/build-windows.yml`): 내 Windows 러너(`self-hosted, windows, x64`)에서 설치 파일과 단독 실행 파일을 만듭니다.
+- **Build Windows** (`.github/workflows/build-windows.yml`): GitHub 서버(`windows-latest`)에서 설치 파일과 단독 실행 파일을 만듭니다.
 - **Build macOS** (`.github/workflows/build-macos.yml`): GitHub 서버(`macos-latest`)에서 `.app`과 `.dmg`를 만듭니다.
 
 둘 다 Actions 탭에서 직접 실행하거나, `v*` 태그를 푸시하면(`test-*`는 시험판) Release에 파일이 붙습니다.

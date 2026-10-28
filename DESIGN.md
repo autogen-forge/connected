@@ -197,10 +197,9 @@ UI는 v1에서 트레이 + TOML 설정, 이후 Tauri GUI.
 
 저장소는 <https://github.com/autogen-forge/connected>다. 워크플로 둘이 `.github/workflows/`에 있다.
 
-- **Build Windows**: 내 Windows 러너(`self-hosted, windows, x64`, `warframe-guidance`와 같은 방식)에서 돈다. 테스트(`bun run test`, `cargo test --workspace`) → NSIS 설치 파일(`tauri build --bundles nsis`) → 명령줄 도구를 만들고, `Connected-setup.exe`, `Connected-portable.exe`, `connected-cli.exe`를 산출물로 올린다.
+- **Build Windows**: GitHub 서버(`windows-latest`)에서 돈다. 처음에는 `warframe-guidance`처럼 self-hosted 러너를 쓰려 했지만, 이 저장소가 공개라서 조직 러너 그룹이 막는다(`Allow public repositories`가 꺼져 있음). 공개 저장소에 self-hosted 러너를 열어 두는 것보다 GitHub 서버를 쓰기로 했다. 테스트(`bun run test`, `cargo test --workspace`) → NSIS 설치 파일(`tauri build --bundles nsis`) → 명령줄 도구를 만들고, `Connected-setup.exe`, `Connected-portable.exe`, `connected-cli.exe`를 산출물로 올린다.
 - **Build macOS**: GitHub 서버(`macos-latest`)에서 돈다. 같은 테스트 → `.app`/`.dmg`(`tauri build --bundles app,dmg`) → 명령줄 도구를 만들고, `Connected-macos.zip`, `Connected-macos.dmg`, `connected-cli-macos`를 올린다. 서명은 ad-hoc이라 처음 열 때 Gatekeeper 경고가 뜰 수 있다.
 - 둘 다 Actions 탭에서 직접 실행하거나 `v*` 태그를 푸시하면 돈다. 태그로 돌면 같은 이름의 Release에 파일이 붙고, `test-*` 태그는 시험판으로 붙는다. 푸시마다 돌리지 않는 것은 macOS 러너의 분 단가가 높기 때문이다.
-- 이 저장소에서 Windows 러너가 잡히려면 러너가 이 저장소(또는 조직)에 등록되어 있어야 한다.
 
 ## 10. 위험 순위
 
