@@ -26,10 +26,10 @@ use windows_sys::Win32::UI::Input::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     CreateCursor, GetSystemMetrics, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLMHF_INJECTED, MSG,
-    MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS, SetCursorPos, SetSystemCursor, SetWindowsHookExW, SystemParametersInfoW, TranslateMessage,
+    MSLLHOOKSTRUCT, PostThreadMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SPI_SETCURSORS, SetCursorPos, SetSystemCursor, SetTimer, SetWindowsHookExW, SystemParametersInfoW, TranslateMessage,
     UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_TIMER, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, XBUTTON1,
 };
 
@@ -330,24 +330,43 @@ unsafe fn create_raw_input_window(
         if window.is_null() {
             return Err("Windows would not create the window that receives mouse movement".into());
         }
-        let device = RAWINPUTDEVICE {
-            usUsagePage: 0x01, // generic desktop
-            usUsage: 0x02,     // mouse
-            dwFlags: RIDEV_INPUTSINK,
-            hwndTarget: window,
-        };
-        if RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) == 0 {
+        if !register_raw_mouse(window) {
             DestroyWindow(window);
             return Err("Windows would not deliver raw mouse input".into());
         }
+        // A process has one raw mouse registration, and a window toolkit in the same process
+        // (the app's own window) takes it over or removes it as its window gains and loses focus.
+        // Registering again every so often takes it back.
+        SetTimer(window, REREGISTER_TIMER, REREGISTER_EVERY_MS, None);
         Ok(window)
     }
+}
+
+const REREGISTER_TIMER: usize = 1;
+const REREGISTER_EVERY_MS: u32 = 250;
+
+/// Asks for raw mouse input to be sent to `window`, even while another program is in front.
+///
+/// # Safety
+/// `window` is a window of the calling thread.
+unsafe fn register_raw_mouse(window: HWND) -> bool {
+    let device = RAWINPUTDEVICE {
+        usUsagePage: 0x01, // generic desktop
+        usUsage: 0x02,     // mouse
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: window,
+    };
+    // SAFETY: one valid device description of the size passed.
+    unsafe { RegisterRawInputDevices(&device, 1, size_of::<RAWINPUTDEVICE>() as u32) != 0 }
 }
 
 unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if message == WM_INPUT {
         // SAFETY: for `WM_INPUT`, `lparam` is the handle of raw input data.
         unsafe { read_raw_input(lparam as HRAWINPUT) };
+    } else if message == WM_TIMER && wparam == REREGISTER_TIMER {
+        // SAFETY: this window belongs to the thread that runs this procedure.
+        unsafe { register_raw_mouse(window) };
     }
     // SAFETY: the arguments are those Windows passed in.
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
