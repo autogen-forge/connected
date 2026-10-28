@@ -69,7 +69,6 @@ let pickedMonitor = null; // which monitor of the only selected computer the per
 let wizardDismissed = false; // the person closed the dialog for now
 let wizardEngaged = false; // the person has opened a settings page from the dialog
 let wizardSeen = false; // the dialog has been shown, so giving the last permission ends in a restart
-const confirmedPanes = new Set(); // the pages the person said they have finished, though the system still reports them missing
 const openedPanes = new Set(); // the settings pages the dialog has opened, so it does not open one twice
 let restartIn = null; // seconds until the restart, while counting down
 let restartTimer = null;
@@ -1303,7 +1302,7 @@ function activityView(view) {
 // ---- dialogs ----
 
 function renderOverlay() {
-  const key = JSON.stringify([snap.pairing, forgetting, snap.pairing_port, wizardShown(), snap.permissions, restartIn, [...openedPanes], [...confirmedPanes]]);
+  const key = JSON.stringify([snap.pairing, forgetting, snap.pairing_port, wizardShown(), snap.permissions, restartIn, [...openedPanes]]);
   if (key === overlayKey) return;
   overlayKey = key;
 
@@ -1336,7 +1335,7 @@ function forgetDialog() {
  * not put it off, and, once everything is given, while the program is about to start over. */
 function wizardShown() {
   if (wizardDismissed || snap.permissions.length === 0) return false;
-  return permissionSteps(snap.permissions, [...confirmedPanes]).current !== -1 || wizardSeen;
+  return permissionSteps(snap.permissions).current !== -1 || wizardSeen;
 }
 
 /**
@@ -1346,7 +1345,7 @@ function wizardShown() {
  */
 function driveWizard() {
   if (!snap || snap.permissions.length === 0) return;
-  const { steps, current } = permissionSteps(snap.permissions, [...confirmedPanes]);
+  const { steps, current } = permissionSteps(snap.permissions);
   if (current !== -1) {
     cancelRestart();
     if (!wizardDismissed) wizardSeen = true;
@@ -1403,12 +1402,11 @@ function reopenWizard() {
   wizardDismissed = false;
   wizardEngaged = false;
   openedPanes.clear();
-  confirmedPanes.clear();
   render();
 }
 
 function permissionDialog() {
-  const { steps, current } = permissionSteps(snap.permissions, [...confirmedPanes]);
+  const { steps, current } = permissionSteps(snap.permissions);
   const later = h('button', { type: 'button', class: 'secondary', text: '나중에', on: { click: laterWizard } });
   const head = h('div', { class: 'dialog-head' },
     icon('shield', 18, 'inline'),
@@ -1447,18 +1445,7 @@ function permissionDialog() {
               text: `‘${step.label}’ 설정 열기`,
               on: { click: () => { wizardEngaged = true; openedPanes.add(step.pane); act('open_privacy_settings', { pane: step.pane }); } },
             }),
-            h('button', { type: 'button', class: 'secondary', text: '권한 요청', on: { click: () => act('request_permissions') } }),
-            h('button', {
-              type: 'button',
-              class: 'secondary',
-              text: '허용했어요',
-              title: '허용했는데 이 창이 넘어가지 않을 때 누르세요',
-              on: { click: () => { confirmedPanes.add(step.pane); render(); } },
-            })),
-          h('p', {
-            class: 'muted small',
-            text: '허용했는데도 자동으로 넘어가지 않으면 ‘허용했어요’를 누르세요. macOS는 허용한 내용을 앱을 다시 시작해야 알려 주는 경우가 있습니다.',
-          }))));
+            h('button', { type: 'button', class: 'secondary', text: '권한 요청', on: { click: () => act('request_permissions') } })))));
   }));
 
   return h('div', { class: 'dialog add' }, head,

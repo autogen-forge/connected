@@ -433,14 +433,3 @@ test('with every permission given there is no current step', () => {
   assert.equal(done.current, -1);
   assert.deepEqual(permissionSteps([]), { steps: [], current: -1 });
 });
-
-test('a step the person confirms counts as done even if the system still reports it missing', () => {
-  const permissions = [
-    { name: 'Accessibility', granted: true },
-    { name: 'Post Events', granted: false },
-    { name: 'Input Monitoring', granted: false },
-  ];
-  assert.equal(permissionSteps(permissions).current, 0, 'Post Events keeps the first step open');
-  assert.equal(permissionSteps(permissions, ['accessibility']).current, 1);
-  assert.equal(permissionSteps(permissions, ['accessibility', 'input_monitoring']).current, -1);
-});

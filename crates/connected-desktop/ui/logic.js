@@ -322,10 +322,9 @@ export function permissionPane(name) {
 /**
  * The steps of giving permissions, one for each page of the system settings, in the order the
  * permissions are listed: `{ pane, label, names, done }`. `current` is the first step not yet
- * done, or -1 when every permission is given. `confirmed` lists pages the person says they have
- * finished.
+ * done, or -1 when every permission is given.
  */
-export function permissionSteps(permissions, confirmed = []) {
+export function permissionSteps(permissions) {
   const steps = [];
   for (const permission of permissions) {
     const page = permissionPane(permission.name);
@@ -336,11 +335,6 @@ export function permissionSteps(permissions, confirmed = []) {
     }
     step.names.push(permission.name);
     if (!permission.granted) step.done = false;
-  }
-  // The system can keep saying a permission is missing after it was given until the program
-  // starts again, so a step the person says is done counts as done.
-  for (const step of steps) {
-    if (confirmed.includes(step.pane)) step.done = true;
   }
   return { steps, current: steps.findIndex((step) => !step.done) };
 }
