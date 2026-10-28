@@ -97,6 +97,11 @@ impl Router {
         actions
     }
 
+    /// Where the router counts the cursor, in the arrangement's coordinates.
+    pub fn position(&self) -> (i32, i32) {
+        self.pos
+    }
+
     /// Tells the router where the real cursor is while input is local.
     pub fn set_local_cursor(&mut self, x: i32, y: i32) {
         if !self.is_remote() {

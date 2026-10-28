@@ -53,6 +53,11 @@ pub trait InputSource: Send {
 
     /// While capturing, events reach `next_event` but not the local desktop.
     fn set_capture(&mut self, capture: bool) -> Result<()>;
+
+    /// How this source is reading input, for the log when something does not work.
+    fn describe(&self) -> String {
+        String::new()
+    }
 }
 
 /// An OS permission the backend needs, and whether this process has it.

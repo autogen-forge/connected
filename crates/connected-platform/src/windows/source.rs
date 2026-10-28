@@ -122,6 +122,14 @@ impl InputSource for WinSource {
         }
     }
 
+    fn describe(&self) -> String {
+        if RAW_SEEN.load(Ordering::Relaxed) {
+            "mouse movement from raw input".into()
+        } else {
+            "mouse movement from hook positions (raw input has not delivered; pushes against a screen edge are missed)".into()
+        }
+    }
+
     fn set_capture(&mut self, capture: bool) -> Result<()> {
         with_shared(|shared| shared.capture = capture)
             .ok_or_else(|| PlatformError::Other("input capture stopped".into()))

@@ -56,6 +56,8 @@ const SCREEN_TIMEOUT: Duration = Duration::from_secs(5);
 const INBOUND_WAIT: Duration = Duration::from_millis(2);
 /// How long the mesh runs before it says that it has read no input at all.
 const DEAF_AFTER: Duration = Duration::from_secs(15);
+/// How often the log shows where the mouse is while it moves on this computer.
+const TRACE_EVERY: Duration = Duration::from_secs(2);
 const PING_EVERY: Duration = Duration::from_secs(2);
 /// Larger than any real display; keeps absurd announcements out of the layout maths.
 const MAX_SCREEN_SIDE: i32 = 100_000;
@@ -731,6 +733,7 @@ fn event_loop(
     let mut heard_input = false;
     let mut warned_deaf = false;
     let started = Instant::now();
+    let mut last_trace: Option<Instant> = None;
     (world.log)(&format!(
         "mesh started, build {} {}",
         option_env!("GITHUB_REF_NAME").unwrap_or("local"),
@@ -787,6 +790,11 @@ fn event_loop(
                 continue;
             }
 
+            let moved = match input {
+                InputEvent::MouseMove { dx, dy } => Some((dx, dy)),
+                _ => None,
+            };
+            let before = world.router.position();
             let actions = world.router.handle(input);
             let stayed_local = actions.is_empty() && !world.router.is_remote();
             let changed = !actions.is_empty();
@@ -801,6 +809,17 @@ fn event_loop(
                 if let Ok((x, y)) = world.screen.cursor() {
                     let (ox, oy) = world.local_origin;
                     world.router.set_local_cursor(x - ox, y - oy);
+                }
+                // Enough to see where a push against an edge goes wrong, without a line per move.
+                if let Some((dx, dy)) = moved {
+                    if last_trace.is_none_or(|at| at.elapsed() > TRACE_EVERY) {
+                        last_trace = Some(Instant::now());
+                        let (x, y) = world.router.position();
+                        (world.log)(&format!(
+                            "mouse moved ({dx},{dy}) from {before:?} to ({x},{y}); {}",
+                            world.source.describe()
+                        ));
+                    }
                 }
             }
         }
