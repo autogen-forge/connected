@@ -7,7 +7,7 @@
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -18,6 +18,7 @@ use connected_core::{InputEvent, InputSource};
 use connected_proto::{ButtonState, MouseButton};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
@@ -55,6 +56,8 @@ static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
 static LAST_RAW_MS: AtomicU64 = AtomicU64::new(0);
 static RAW_MOVES: AtomicU64 = AtomicU64::new(0);
 static HOOK_MOVES: AtomicU64 = AtomicU64::new(0);
+/// Movement this soon after capture begins is not counted: the clock hooks use ticks coarsely.
+const CAPTURE_SETTLE_MS: u32 = 20;
 /// How long after raw input's last movement the hook's positions are still left out.
 const RAW_RECENT_MS: u64 = 150;
 
@@ -67,6 +70,10 @@ fn raw_is_recent() -> bool {
     let last = LAST_RAW_MS.load(Ordering::Relaxed);
     last != 0 && now_ms().saturating_sub(last) < RAW_RECENT_MS
 }
+/// The time (in the clock hooks stamp their events with) before which movement is not counted
+/// while capturing. Events already on their way when capture began carry positions from before
+/// the cursor was moved to the anchor, and would count as a huge jump.
+static CAPTURE_SINCE: AtomicU32 = AtomicU32::new(0);
 /// Whether captured movement is being counted against the anchor (as opposed to only blocked).
 static ANCHORED: AtomicBool = AtomicBool::new(false);
 static LAST_HOOK_X: AtomicI32 = AtomicI32::new(i32::MIN);
@@ -165,6 +172,8 @@ impl InputSource for WinSource {
                 let (x, y) = (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2);
                 SetCursorPos(x, y);
             }
+            // SAFETY: an argument-free query.
+            CAPTURE_SINCE.store(unsafe { GetTickCount() }.wrapping_add(CAPTURE_SETTLE_MS), Ordering::Relaxed);
             ANCHORED.store(true, Ordering::Relaxed);
             hide_cursor();
         } else {
@@ -459,6 +468,11 @@ fn mouse_event(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
             let (x, y) = (info.pt.x, info.pt.y);
             if with_shared(|shared| shared.capture).unwrap_or(false) {
                 if !ANCHORED.load(Ordering::Relaxed) {
+                    return true;
+                }
+                // Still on its way from before capture began: its position is from before the
+                // cursor was moved, and would count as a jump of the distance between them.
+                if (info.time.wrapping_sub(CAPTURE_SINCE.load(Ordering::Relaxed)) as i32) < 0 {
                     return true;
                 }
                 // Swallowed movement leaves the cursor where it is, so the hook's position minus
